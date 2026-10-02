@@ -1,5 +1,7 @@
 import fnmatch
+import hashlib
 import json
+import math
 from collections.abc import Mapping
 
 _ALLOWED_FIELDS = frozenset(
@@ -73,6 +75,51 @@ def _reject_duplicate_keys(pairs):
 def _reject_constant(value):
     # json.loads accepts NaN/Infinity by default; strict JSON does not.
     raise ValueError("invalid JSON constant %r" % value)
+
+
+# --- canonical snapshot serialization (to_json / fingerprint) ------------
+#
+# A snapshot must be lossless strict JSON and byte-stable across calls, so
+# every value is validated and copied into a fresh structure first: tuples,
+# sets, other non-JSON containers, non-finite numbers and mappings with
+# non-string keys raise ValueError tagged with the fixed marker
+# ``non_json_value``; mapping keys are sorted by Unicode code point at every
+# nesting level. The caller's mappings are never mutated or aliased.
+
+def _canonical_snapshot_value(value, location):
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, str) or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                "non_json_value: %s is %r, not a finite JSON number"
+                % (location, value)
+            )
+        return value
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key in value:
+            if not isinstance(key, str):
+                raise ValueError(
+                    "non_json_value: %s contains a non-string mapping key %r"
+                    % (location, key)
+                )
+            normalized[key] = _canonical_snapshot_value(
+                value[key], "%s[%r]" % (location, key)
+            )
+        # Rebuild in Unicode (code-point) dictionary order.
+        return {key: normalized[key] for key in sorted(normalized)}
+    if isinstance(value, list):
+        return [
+            _canonical_snapshot_value(item, "%s[%d]" % (location, index))
+            for index, item in enumerate(value)
+        ]
+    raise ValueError(
+        "non_json_value: %s has type %s, which cannot be represented in "
+        "strict JSON" % (location, type(value).__name__)
+    )
 
 
 # --- static pattern analysis (used by PolicyGate.audit) ------------------
@@ -459,6 +506,74 @@ class PolicyGate:
                 )
 
         return cls(rules)
+
+    def _snapshot(self):
+        """Canonical, fully normalized copy of the loaded rules.
+
+        Rules stay in declaration order; each rule exposes exactly the
+        normalized ``id``, ``effect``, ``priority``, ``subject``,
+        ``action``, ``resource`` and ``tags`` that actually drive
+        decisions (defaults made explicit, the internal ``_index``
+        omitted). Mapping keys, including nested tag mappings, are
+        recursively sorted by Unicode code point. Raises ``ValueError``
+        whose message carries the fixed marker ``non_json_value`` when a
+        value cannot be represented losslessly in strict JSON; no partial
+        snapshot escapes in that case.
+        """
+        return _canonical_snapshot_value(
+            [
+                {
+                    "id": rule["id"],
+                    "effect": rule["effect"],
+                    "priority": rule["priority"],
+                    "subject": rule["subject"],
+                    "action": rule["action"],
+                    "resource": rule["resource"],
+                    "tags": rule["tags"],
+                }
+                for rule in self.rules
+            ],
+            "rules",
+        )
+
+    def to_json(self):
+        """Export the loaded rules as canonical strict JSON text.
+
+        The root value is an array preserving declaration order; every
+        rule writes the normalized, actually-effective ``id``,
+        ``effect``, ``priority``, ``subject``, ``action``, ``resource``
+        and ``tags``, with defaults explicit and no internal indexes.
+        Mapping keys are recursively sorted by Unicode code point,
+        separators are compact and non-ASCII characters are preserved
+        unescaped. An empty rule set exports as ``[]`` and repeated calls
+        on an unchanged instance return byte-identical text.
+
+        The text round-trips through :meth:`from_json` with identical
+        decide/explain/decide_many/audit behavior; neither the rules nor
+        any caller-provided mapping is modified or aliased. A rule value
+        that cannot be represented losslessly in strict JSON (tuples,
+        sets, non-finite numbers, mappings with non-string keys, ...)
+        raises ``ValueError`` tagged ``non_json_value`` before any text
+        is produced. Performs no file, network or other external I/O.
+        """
+        snapshot = self._snapshot()
+        return json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    def fingerprint(self):
+        """SHA-256 of the canonical snapshot as UTF-8 bytes.
+
+        Returns the lowercase hexadecimal digest, always 64 characters,
+        computed over exactly the text :meth:`to_json` produces. A
+        snapshot that cannot be encoded as strict JSON raises the same
+        ``ValueError`` tagged ``non_json_value`` as ``to_json``.
+        Performs no I/O.
+        """
+        return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
 
     @staticmethod
     def _matches(rule, subject, action, resource, tags):

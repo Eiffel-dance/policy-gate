@@ -1,3 +1,5 @@
+import hashlib
+import json
 import unittest
 
 from app import PolicyConfigError, PolicyGate
@@ -790,6 +792,204 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(finding["rule"], "read")
         self.assertEqual(finding["other_rule"], "1")
         self.assertEqual(finding["winner"], "1")
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_empty_rules_export_as_empty_array(self):
+        self.assertEqual(PolicyGate([]).to_json(), "[]")
+
+    def test_defaults_are_explicit_and_index_omitted(self):
+        text = PolicyGate([{"effect": "allow"}]).to_json()
+        rule = json.loads(text)[0]
+        self.assertEqual(
+            rule,
+            {
+                "id": "0",
+                "effect": "allow",
+                "priority": 0,
+                "subject": "*",
+                "action": "*",
+                "resource": "*",
+                "tags": {},
+            },
+        )
+        self.assertNotIn("_index", rule)
+
+    def test_keys_sorted_recursively_and_order_preserved(self):
+        gate = PolicyGate(
+            [
+                {
+                    "id": "z",
+                    "effect": "deny",
+                    "priority": -3,
+                    "tags": {"b": "x", "a": {"z": 1, "a": 2}},
+                },
+                {"effect": "allow"},
+            ]
+        )
+        text = gate.to_json()
+        # compact separators, no spaces
+        self.assertNotIn(" ", text)
+        # rules stay in declaration order (second rule's default id is "1")
+        self.assertLess(text.index('"id":"z"'), text.index('"id":"1"'))
+        # rule-level keys sorted
+        first = json.loads(text)[0]
+        self.assertEqual(list(first), sorted(first))
+        # nested tag keys sorted at every level
+        self.assertEqual(list(first["tags"]), ["a", "b"])
+        self.assertEqual(list(first["tags"]["a"]), ["a", "z"])
+
+    def test_non_ascii_preserved(self):
+        gate = PolicyGate(
+            [{"id": "中", "effect": "allow", "resource": "docs/ü"}]
+        )
+        text = gate.to_json()
+        self.assertIn("中", text)
+        self.assertIn("ü", text)
+        self.assertNotIn("\\u", text)
+        json.loads(text)  # still strict JSON
+
+    def test_repeated_calls_are_identical(self):
+        gate = PolicyGate(
+            [
+                {"effect": "allow"},
+                {"id": "z", "effect": "deny", "tags": {"b": 1, "a": 2}},
+            ]
+        )
+        first = gate.to_json()
+        for _ in range(10):
+            self.assertEqual(gate.to_json(), first)
+
+    def test_roundtrip_preserves_everything(self):
+        rules = [
+            {"id": "read", "effect": "allow", "action": "read",
+             "resource": "docs/*", "priority": 2},
+            {"effect": "deny", "resource": "secret/*",
+             "tags": {"env": "prod"}},
+            {"id": "num", "effect": "allow", "priority": 5,
+             "tags": {"b": 1, "a": {"y": 2, "x": [1, 2]}}},
+        ]
+        gate = PolicyGate(rules)
+        text = gate.to_json()
+        reloaded = PolicyGate.from_json(text)
+        requests = [
+            {"subject": "u", "action": "read", "resource": "docs/a"},
+            {"subject": "u", "action": "read", "resource": "secret/x",
+             "tags": {"env": "prod"}},
+            {"subject": "u", "action": "write", "resource": "z",
+             "tags": {"a": {"x": [1, 2], "y": 2}, "b": 1}},
+        ]
+        for request in requests:
+            self.assertEqual(
+                reloaded.decide(request["subject"], request["action"],
+                                request["resource"], request.get("tags")),
+                gate.decide(request["subject"], request["action"],
+                            request["resource"], request.get("tags")),
+            )
+            self.assertEqual(
+                reloaded.explain(request["subject"], request["action"],
+                                 request["resource"], request.get("tags")),
+                gate.explain(request["subject"], request["action"],
+                             request["resource"], request.get("tags")),
+            )
+        self.assertEqual(reloaded.decide_many(requests),
+                         gate.decide_many(requests))
+        self.assertEqual(reloaded.audit(), gate.audit())
+        # snapshot is stable across the round trip
+        self.assertEqual(reloaded.to_json(), text)
+
+    def test_export_does_not_mutate_rules_or_caller_data(self):
+        import copy
+
+        rules = [{"effect": "allow", "tags": {"b": 1, "a": 2}}]
+        rules_copy = copy.deepcopy(rules)
+        caller_tags = {"k": "v"}
+        tags_copy = dict(caller_tags)
+        gate = PolicyGate(rules)
+        gate.to_json()
+        gate.fingerprint()
+        gate.decide("s", "a", "r", caller_tags)
+        self.assertEqual(rules, rules_copy)
+        self.assertEqual(caller_tags, tags_copy)
+        # snapshot must not alias a mutable internal mapping
+        parsed = json.loads(gate.to_json())
+        parsed[0]["tags"]["injected"] = True
+        self.assertNotIn("injected", gate.rules[0]["tags"])
+
+    def test_non_json_values_raise_value_error(self):
+        # nested values the constructor does not inspect
+        for bad_value in (
+            ("a", "b"),       # tuple
+            {1, 2},           # set
+            float("nan"),     # non-finite
+            float("inf"),
+            float("-inf"),
+            {1: "v"},         # non-string mapping key
+            [1, (2, 3)],      # tuple nested in list
+        ):
+            gate = PolicyGate(
+                [{"id": "x", "effect": "allow", "tags": {"k": bad_value}}]
+            )
+            for method in ("to_json", "fingerprint"):
+                with self.subTest(value=bad_value, method=method):
+                    with self.assertRaises(ValueError) as ctx:
+                        getattr(gate, method)()
+                    self.assertNotIsInstance(
+                        ctx.exception, PolicyConfigError
+                    )
+                    self.assertIn("non_json_value", str(ctx.exception))
+
+    def test_failed_export_leaves_instance_intact(self):
+        import copy
+
+        gate = PolicyGate(
+            [{"id": "x", "effect": "allow", "tags": {"k": ("a",)}}]
+        )
+        before = copy.deepcopy(gate.rules)
+        with self.assertRaises(ValueError):
+            gate.to_json()
+        self.assertEqual(gate.rules, before)
+        self.assertEqual(
+            gate.decide("s", "a", "r", {"k": ("a",)})["rule"], "x"
+        )
+
+    def test_fingerprint_matches_sha256_of_utf8_snapshot(self):
+        gate = PolicyGate(
+            [{"id": "中", "effect": "allow", "tags": {"b": 1, "a": 2}}]
+        )
+        digest = gate.fingerprint()
+        self.assertEqual(
+            digest,
+            hashlib.sha256(gate.to_json().encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, digest.lower())
+        self.assertTrue(all(c in "0123456789abcdef" for c in digest))
+
+    def test_fingerprint_stable_and_discriminating(self):
+        self.assertEqual(
+            PolicyGate([]).fingerprint(),
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertEqual(
+            PolicyGate([{"id": "a", "effect": "allow"}]).fingerprint(),
+            PolicyGate([{"id": "a", "effect": "allow"}]).fingerprint(),
+        )
+        self.assertNotEqual(
+            PolicyGate([{"id": "a", "effect": "allow"}]).fingerprint(),
+            PolicyGate([{"id": "a", "effect": "deny"}]).fingerprint(),
+        )
+
+    def test_fingerprint_and_to_json_share_one_snapshot(self):
+        gate = PolicyGate(
+            [{"id": "x", "effect": "allow", "tags": {"k": float("nan")}}]
+        )
+        with self.assertRaises(ValueError) as json_ctx:
+            gate.to_json()
+        with self.assertRaises(ValueError) as fp_ctx:
+            gate.fingerprint()
+        self.assertIn("non_json_value", str(json_ctx.exception))
+        self.assertIn("non_json_value", str(fp_ctx.exception))
 
 
 if __name__ == "__main__":
