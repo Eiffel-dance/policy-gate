@@ -6,6 +6,7 @@ _ALLOWED_FIELDS = frozenset(
     {"id", "effect", "priority", "subject", "action", "resource", "tags"}
 )
 _STRING_FIELDS = ("subject", "action", "resource")
+_REQUEST_FIELDS = frozenset({"subject", "action", "resource", "tags"})
 
 
 class PolicyConfigError(Exception):
@@ -20,6 +21,40 @@ class PolicyConfigError(Exception):
     def __init__(self, code, message):
         self.code = code
         super().__init__("[%s] %s" % (code, message))
+
+
+class PolicyBatchError(Exception):
+    """A batch handed to :meth:`PolicyGate.decide_many` failed validation.
+
+    The machine-readable ``code`` attribute is one of ``invalid_batch``,
+    ``item_not_mapping``, ``unknown_field``, ``missing_field`` or
+    ``invalid_field_type``. ``index`` is the offending element index, or
+    ``None`` when the outer batch value itself is not a list or tuple.
+    ``field`` names the offending request field for the field-level codes
+    and is ``None`` otherwise.
+    """
+
+    def __init__(self, code, index, field=None, message=None):
+        self.code = code
+        self.index = index
+        self.field = field
+        if message is None:
+            message = self._default_message(code, index, field)
+        super().__init__("[%s] %s" % (code, message))
+
+    @staticmethod
+    def _default_message(code, index, field):
+        if code == "invalid_batch":
+            return "batch must be a list or tuple of request mappings"
+        if code == "item_not_mapping":
+            return "request at index %s must be a mapping" % index
+        if code == "unknown_field":
+            return "request at index %d contains unknown field %r" % (index, field)
+        if code == "missing_field":
+            return "request at index %d is missing required field %r" % (index, field)
+        if code == "invalid_field_type":
+            return "request at index %d field %r has an invalid type" % (index, field)
+        return "batch validation failed"
 
 
 class _DuplicateKeyError(ValueError):
@@ -219,6 +254,71 @@ class PolicyGate:
     def decide(self, subject, action, resource, tags=None):
         result, _matched = self._evaluate(subject, action, resource, tags)
         return result
+
+    @staticmethod
+    def _validate_batch_item(item, index):
+        # Within one item, error classes are checked unknown-field first,
+        # then missing-field, then field-type; ties resolve in the fixed
+        # subject/action/resource/tags order.
+        unknown = [k for k in item if k not in _REQUEST_FIELDS]
+        if unknown:
+            raise PolicyBatchError("unknown_field", index, field=unknown[0])
+
+        for field in _STRING_FIELDS:
+            if field not in item:
+                raise PolicyBatchError("missing_field", index, field=field)
+
+        for field in _STRING_FIELDS:
+            if not isinstance(item[field], str):
+                raise PolicyBatchError("invalid_field_type", index, field=field)
+
+        if "tags" in item:
+            tags = item["tags"]
+            if tags is not None and not isinstance(tags, Mapping):
+                raise PolicyBatchError(
+                    "invalid_field_type", index, field="tags"
+                )
+
+    def decide_many(self, requests):
+        """Evaluate many requests in one offline, reviewable batch.
+
+        ``requests`` must be a list or tuple of mappings, each limited to
+        the keys ``subject``, ``action``, ``resource`` and ``tags``. The
+        first three are required strings; ``tags`` may be omitted, be
+        ``None`` or be any mapping accepted by :meth:`decide`.
+
+        Returns ``{"decisions": [...], "summary": {"total", "allow",
+        "deny"}}`` with decisions in input order, each identical to what a
+        plain :meth:`decide` call would return. An empty batch yields an
+        empty decision list and an all-zero summary.
+
+        The whole batch is validated before any decision is computed, so a
+        malformed batch raises :class:`PolicyBatchError` and never produces
+        partial results. Rules and caller data are never modified.
+        """
+        if not isinstance(requests, (list, tuple)):
+            raise PolicyBatchError("invalid_batch", None)
+
+        for index, item in enumerate(requests):
+            if not isinstance(item, Mapping):
+                raise PolicyBatchError("item_not_mapping", index)
+            self._validate_batch_item(item, index)
+
+        decisions = [
+            self.decide(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            for item in requests
+        ]
+        summary = {
+            "total": len(decisions),
+            "allow": sum(1 for d in decisions if d["effect"] == "allow"),
+            "deny": sum(1 for d in decisions if d["effect"] == "deny"),
+        }
+        return {"decisions": decisions, "summary": summary}
 
     def explain(self, subject, action, resource, tags=None):
         """Read-only offline view of one decision and its full evidence.
