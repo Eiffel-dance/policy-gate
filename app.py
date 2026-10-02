@@ -86,7 +86,8 @@ class PolicyGate:
             and all(tags.get(k) == v for k, v in rule["tags"].items())
         )
 
-    def decide(self, subject, action, resource, tags=None):
+    @staticmethod
+    def _check_inputs(subject, action, resource, tags):
         for name, value in (
             ("subject", subject),
             ("action", action),
@@ -98,6 +99,11 @@ class PolicyGate:
             tags = {}
         elif not isinstance(tags, Mapping):
             raise TypeError("tags must be a mapping or None")
+        return tags
+
+    def _evaluate(self, subject, action, resource, tags):
+        """Shared decision core; returns (decision, matched rules in order)."""
+        tags = self._check_inputs(subject, action, resource, tags)
 
         matched = [
             r
@@ -111,7 +117,10 @@ class PolicyGate:
         # then the earliest declaration order breaks ties deterministically.
         winners = denies if denies else allows
         if not winners:
-            return {"effect": "deny", "rule": None, "reason": "default deny"}
+            return (
+                {"effect": "deny", "rule": None, "reason": "default deny"},
+                matched,
+            )
 
         winner = min(winners, key=lambda r: (-r["priority"], r["_index"]))
         reason = "matched %s rule %r (priority %d)" % (
@@ -121,4 +130,26 @@ class PolicyGate:
         )
         if winner["effect"] == "deny" and allows:
             reason += "; explicit deny overrides allow"
-        return {"effect": winner["effect"], "rule": winner["id"], "reason": reason}
+        return (
+            {"effect": winner["effect"], "rule": winner["id"], "reason": reason},
+            matched,
+        )
+
+    def decide(self, subject, action, resource, tags=None):
+        result, _matched = self._evaluate(subject, action, resource, tags)
+        return result
+
+    def explain(self, subject, action, resource, tags=None):
+        """Read-only offline view of one decision and its full evidence.
+
+        Shares decide()'s validation and selection semantics; adds
+        matched_rules, every actually matched rule in declaration order.
+        Does not mutate the rule list or touch any external state.
+        """
+        result, matched = self._evaluate(subject, action, resource, tags)
+        explanation = dict(result)
+        explanation["matched_rules"] = [
+            {"id": r["id"], "effect": r["effect"], "priority": r["priority"]}
+            for r in matched
+        ]
+        return explanation
