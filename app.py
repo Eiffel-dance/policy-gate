@@ -86,7 +86,8 @@ class PolicyGate:
             and all(tags.get(k) == v for k, v in rule["tags"].items())
         )
 
-    def decide(self, subject, action, resource, tags=None):
+    @staticmethod
+    def _validate_request(subject, action, resource, tags):
         for name, value in (
             ("subject", subject),
             ("action", action),
@@ -98,7 +99,9 @@ class PolicyGate:
             tags = {}
         elif not isinstance(tags, Mapping):
             raise TypeError("tags must be a mapping or None")
+        return tags
 
+    def _evaluate(self, subject, action, resource, tags):
         matched = [
             r
             for r in self.rules
@@ -111,7 +114,10 @@ class PolicyGate:
         # then the earliest declaration order breaks ties deterministically.
         winners = denies if denies else allows
         if not winners:
-            return {"effect": "deny", "rule": None, "reason": "default deny"}
+            return (
+                {"effect": "deny", "rule": None, "reason": "default deny"},
+                matched,
+            )
 
         winner = min(winners, key=lambda r: (-r["priority"], r["_index"]))
         reason = "matched %s rule %r (priority %d)" % (
@@ -121,4 +127,32 @@ class PolicyGate:
         )
         if winner["effect"] == "deny" and allows:
             reason += "; explicit deny overrides allow"
-        return {"effect": winner["effect"], "rule": winner["id"], "reason": reason}
+        return (
+            {
+                "effect": winner["effect"],
+                "rule": winner["id"],
+                "reason": reason,
+            },
+            matched,
+        )
+
+    def decide(self, subject, action, resource, tags=None):
+        tags = self._validate_request(subject, action, resource, tags)
+        decision, _matched = self._evaluate(subject, action, resource, tags)
+        return decision
+
+    def explain(self, subject, action, resource, tags=None):
+        """Read-only view of one decision and every rule that matched.
+
+        Shares decide()'s validation and evaluation, so effect/rule/reason
+        are identical for the same input. Does not mutate rule state and
+        performs no I/O.
+        """
+        tags = self._validate_request(subject, action, resource, tags)
+        decision, matched = self._evaluate(subject, action, resource, tags)
+        result = dict(decision)
+        result["matched_rules"] = [
+            {"id": r["id"], "effect": r["effect"], "priority": r["priority"]}
+            for r in matched
+        ]
+        return result

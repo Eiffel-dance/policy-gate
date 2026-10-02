@@ -228,5 +228,148 @@ class DecideInputValidationTest(unittest.TestCase):
             self.assertIn(effect, ("allow", "deny"))
 
 
+class ExplainTest(unittest.TestCase):
+    def test_default_deny_empty_policy(self):
+        gate = PolicyGate([])
+        result = gate.explain("alice", "read", "data/x")
+        self.assertEqual(result["effect"], "deny")
+        self.assertIsNone(result["rule"])
+        self.assertEqual(result["reason"], "default deny")
+        self.assertEqual(result["matched_rules"], [])
+
+    def test_matched_rules_declaration_order_and_shape(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "priority": 1},
+                {"id": "nomatch", "effect": "allow", "subject": "bob"},
+                {"id": "a2", "effect": "allow", "priority": 10},
+            ]
+        )
+        result = gate.explain("s", "a", "r")
+        self.assertEqual(
+            result["matched_rules"],
+            [
+                {"id": "a1", "effect": "allow", "priority": 1},
+                {"id": "a2", "effect": "allow", "priority": 10},
+            ],
+        )
+        # winner follows priority, not list order
+        self.assertEqual(result["rule"], "a2")
+        for entry in result["matched_rules"]:
+            self.assertEqual(set(entry), {"id", "effect", "priority"})
+
+    def test_deny_overrides_allow_lists_both(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "priority": 100},
+                {"id": "d1", "effect": "deny", "priority": -5},
+                {"id": "miss", "effect": "deny", "subject": "bob"},
+            ]
+        )
+        result = gate.explain("s", "a", "r")
+        self.assertEqual(result["effect"], "deny")
+        self.assertEqual(result["rule"], "d1")
+        self.assertEqual(
+            result["matched_rules"],
+            [
+                {"id": "a1", "effect": "allow", "priority": 100},
+                {"id": "d1", "effect": "deny", "priority": -5},
+            ],
+        )
+
+    def test_matches_decide_for_many_inputs(self):
+        gate = PolicyGate(
+            [
+                {"id": "read", "effect": "allow", "action": "read",
+                 "resource": "docs/*"},
+                {"id": "tagged", "effect": "allow", "tags": {"env": "prod"}},
+                {"id": "lock", "effect": "deny", "resource": "prod/*"},
+            ]
+        )
+        cases = [
+            ("alice", "read", "docs/a", None),
+            ("bob", "write", "x", {"env": "prod", "extra": 1}),
+            ("alice", "read", "prod/db", {"env": "prod"}),
+            ("x", "READ", "docs/a", {}),
+            ("x", "read", "else", {"env": "dev"}),
+        ]
+        for case in cases:
+            d = gate.decide(*case)
+            e = gate.explain(*case)
+            self.assertEqual(e["effect"], d["effect"], case)
+            self.assertEqual(e["rule"], d["rule"], case)
+            self.assertEqual(e["reason"], d["reason"], case)
+
+    def test_wildcards_and_negative_and_equal_priority(self):
+        gate = PolicyGate(
+            [
+                {"id": "neg", "effect": "allow", "priority": -10,
+                 "resource": "data/*"},
+                {"id": "zero1", "effect": "allow", "priority": 0},
+                {"id": "zero2", "effect": "allow", "priority": 0,
+                 "subject": "*"},
+            ]
+        )
+        result = gate.explain("s", "a", "data/x")
+        self.assertEqual(
+            result["matched_rules"],
+            [
+                {"id": "neg", "effect": "allow", "priority": -10},
+                {"id": "zero1", "effect": "allow", "priority": 0},
+                {"id": "zero2", "effect": "allow", "priority": 0},
+            ],
+        )
+        self.assertEqual(result["rule"], "zero1")
+        # case-sensitive wildcard: DATA/* does not match data/x
+        gate2 = PolicyGate(
+            [{"id": "c", "effect": "allow", "resource": "DATA/*"}]
+        )
+        r2 = gate2.explain("s", "a", "data/x")
+        self.assertEqual(r2["matched_rules"], [])
+        self.assertEqual(r2["reason"], "default deny")
+
+    def test_repeatable_and_does_not_mutate_state(self):
+        rules = [
+            {"id": "a1", "effect": "allow", "priority": 1},
+            {"id": "d1", "effect": "deny", "priority": 2},
+        ]
+        gate = PolicyGate(rules)
+        before = [dict(r) for r in gate.rules]
+        first = gate.explain("s", "a", "r")
+        second = gate.explain("s", "a", "r")
+        self.assertEqual(first, second)
+        self.assertEqual([dict(r) for r in gate.rules], before)
+        # caller mutating the returned object must not change later results
+        first["matched_rules"].append({"id": "tampered"})
+        first["matched_rules"][0]["priority"] = 999
+        self.assertEqual(gate.explain("s", "a", "r"), second)
+
+    def test_input_validation_matches_decide(self):
+        gate = PolicyGate([{"id": "x", "effect": "allow"}])
+        for bad in (
+            (1, "a", "r"),
+            ("s", ["a"], "r"),
+            ("s", "a", None),
+        ):
+            with self.assertRaises(TypeError):
+                gate.decide(*bad)
+            with self.assertRaises(TypeError):
+                gate.explain(*bad)
+        for bad_tags in ("k=v", [("k", "v")]):
+            with self.assertRaises(TypeError):
+                gate.explain("s", "a", "r", tags=bad_tags)
+        # None tags behave like an empty mapping
+        result = gate.explain("s", "a", "r", tags=None)
+        self.assertEqual(result["effect"], "allow")
+        self.assertEqual(len(result["matched_rules"]), 1)
+
+    def test_explain_result_is_plain_data(self):
+        gate = PolicyGate([{"id": "x", "effect": "allow"}])
+        result = gate.explain("s", "a", "r")
+        self.assertEqual(
+            set(result), {"effect", "rule", "reason", "matched_rules"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
