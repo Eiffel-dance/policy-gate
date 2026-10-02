@@ -1,10 +1,37 @@
 import fnmatch
+import json
 from collections.abc import Mapping
 
 _ALLOWED_FIELDS = frozenset(
     {"id", "effect", "priority", "subject", "action", "resource", "tags"}
 )
 _STRING_FIELDS = ("subject", "action", "resource")
+
+
+class PolicyConfigError(Exception):
+    """Raised when a JSON policy document cannot be loaded.
+
+    Carries a public string ``code`` identifying the failure category:
+    ``invalid_json``, ``duplicate_key``, ``root_not_array`` or
+    ``rule_not_object``. Semantic rule violations still surface as the
+    constructor's plain ValueError.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook that refuses silent last-wins key overwrites."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise PolicyConfigError(
+                "duplicate_key", "duplicate key %r in JSON object" % key
+            )
+        obj[key] = value
+    return obj
 
 
 class PolicyGate:
@@ -76,6 +103,42 @@ class PolicyGate:
                     "_index": i,
                 }
             )
+
+    @classmethod
+    def from_json(cls, document):
+        """Load a gate from a JSON text string.
+
+        The root value must be an array of rule objects; each rule is
+        validated by the regular constructor, so all field constraints,
+        defaults and matching semantics are identical to PolicyGate(rules).
+        Duplicate keys at any nesting level are rejected instead of
+        silently overwriting earlier values. Loading performs no decision,
+        no file or network access, and never mutates the input text.
+
+        Raises TypeError for a non-string document, PolicyConfigError for
+        malformed JSON / duplicate keys / wrong root or element shape, and
+        ValueError for semantic rule violations (first offending index).
+        """
+        if not isinstance(document, str):
+            raise TypeError("document must be a JSON text string")
+        try:
+            data = json.loads(document, object_pairs_hook=_reject_duplicate_keys)
+        except PolicyConfigError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise PolicyConfigError(
+                "invalid_json", "invalid JSON document: %s" % exc
+            ) from exc
+        if not isinstance(data, list):
+            raise PolicyConfigError(
+                "root_not_array", "root value must be an array of rule objects"
+            )
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise PolicyConfigError(
+                    "rule_not_object", "rule %d: rule must be an object" % i
+                )
+        return cls(data)
 
     @staticmethod
     def _matches(rule, subject, action, resource, tags):

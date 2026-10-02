@@ -1,6 +1,6 @@
 import unittest
 
-from app import PolicyGate
+from app import PolicyConfigError, PolicyGate
 
 
 class BackwardCompatTest(unittest.TestCase):
@@ -354,6 +354,102 @@ class ExplainTest(unittest.TestCase):
         self.assertEqual(
             gate.explain("alice", "read", "prod/db", {"env": "dev"})["matched_rules"],
             first["matched_rules"][:-1],
+        )
+
+
+class FromJsonTest(unittest.TestCase):
+    def test_loads_and_decides_like_constructor(self):
+        document = (
+            '[{"id": "read", "effect": "allow", "action": "read"},'
+            ' {"effect": "deny", "resource": "prod/*", "priority": 3,'
+            '  "tags": {"env": "prod"}}]'
+        )
+        gate = PolicyGate.from_json(document)
+        self.assertEqual(gate.rules[1]["id"], "1")
+        self.assertEqual(
+            gate.decide("alice", "read", "prod/db", {"env": "prod"})["rule"],
+            "1",
+        )
+        self.assertEqual(
+            gate.decide("alice", "read", "dev/db")["rule"], "read"
+        )
+        explanation = gate.explain("alice", "read", "prod/db", {"env": "prod"})
+        self.assertEqual(explanation["effect"], "deny")
+        self.assertEqual(
+            [r["id"] for r in explanation["matched_rules"]], ["read", "1"]
+        )
+
+    def test_empty_array_is_default_deny(self):
+        gate = PolicyGate.from_json("[]")
+        result = gate.decide("s", "a", "r")
+        self.assertEqual(result["effect"], "deny")
+        self.assertEqual(result["reason"], "default deny")
+
+    def test_non_string_document_raises_type_error(self):
+        for bad in (b"[]", 42, None, [{"effect": "allow"}], ("x",)):
+            with self.assertRaises(TypeError):
+                PolicyGate.from_json(bad)
+
+    def _expect_config_error(self, document, code):
+        with self.assertRaises(PolicyConfigError) as ctx:
+            PolicyGate.from_json(document)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_invalid_json(self):
+        self._expect_config_error("[{", "invalid_json")
+        self._expect_config_error("not json", "invalid_json")
+        self._expect_config_error("", "invalid_json")
+
+    def test_duplicate_key_at_rule_level(self):
+        self._expect_config_error(
+            '[{"effect": "allow", "effect": "deny"}]', "duplicate_key"
+        )
+
+    def test_duplicate_key_nested_in_tags(self):
+        self._expect_config_error(
+            '[{"effect": "allow", "tags": {"k": "a", "k": "b"}}]',
+            "duplicate_key",
+        )
+
+    def test_root_not_array(self):
+        for doc in ("{}", '"x"', "1", "null", "true"):
+            self._expect_config_error(doc, "root_not_array")
+
+    def test_rule_not_object(self):
+        self._expect_config_error('[["effect"]]', "rule_not_object")
+        self._expect_config_error('[{"effect": "allow"}, 3]', "rule_not_object")
+        self._expect_config_error("[null]", "rule_not_object")
+
+    def test_semantic_errors_stay_value_error_with_index(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow"}, {"id": "bad", "priority": "nope",'
+                ' "effect": "allow"}]'
+            )
+        self.assertNotIsInstance(ctx.exception, PolicyConfigError)
+        self.assertIn("rule 1", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            PolicyGate.from_json('[{"effect": "maybe"}]')
+        with self.assertRaises(ValueError):
+            PolicyGate.from_json(
+                '[{"id": "x", "effect": "allow"},'
+                ' {"id": "x", "effect": "deny"}]'
+            )
+        with self.assertRaises(ValueError):
+            PolicyGate.from_json('[{"effect": "allow", "sourc3": 1}]')
+
+    def test_failed_load_leaves_no_instance(self):
+        with self.assertRaises(PolicyConfigError):
+            PolicyGate.from_json('{"effect": "allow"}')
+        # a subsequent valid load is unaffected
+        gate = PolicyGate.from_json('[{"effect": "allow"}]')
+        self.assertEqual(gate.decide("s", "a", "r")["effect"], "allow")
+
+    def test_constructor_still_accepts_list_and_tuple(self):
+        rules = [{"id": "x", "effect": "allow"}]
+        self.assertEqual(PolicyGate(rules).decide("s", "a", "r")["rule"], "x")
+        self.assertEqual(
+            PolicyGate(tuple(rules)).decide("s", "a", "r")["rule"], "x"
         )
 
 
