@@ -673,6 +673,19 @@ class PolicyGate:
                     "invalid_field_type", index, field="tags"
                 )
 
+    @staticmethod
+    def _validate_requests(requests):
+        # Shared by decide_many() and compare(): the whole batch is checked
+        # before any decision is computed, so a malformed batch never
+        # produces partial results.
+        if not isinstance(requests, (list, tuple)):
+            raise PolicyBatchError("invalid_batch", None)
+
+        for index, item in enumerate(requests):
+            if not isinstance(item, Mapping):
+                raise PolicyBatchError("item_not_mapping", index)
+            PolicyGate._validate_batch_item(item, index)
+
     def decide_many(self, requests):
         """Evaluate many requests in one offline, reviewable batch.
 
@@ -690,13 +703,7 @@ class PolicyGate:
         malformed batch raises :class:`PolicyBatchError` and never produces
         partial results. Rules and caller data are never modified.
         """
-        if not isinstance(requests, (list, tuple)):
-            raise PolicyBatchError("invalid_batch", None)
-
-        for index, item in enumerate(requests):
-            if not isinstance(item, Mapping):
-                raise PolicyBatchError("item_not_mapping", index)
-            self._validate_batch_item(item, index)
+        self._validate_requests(requests)
 
         decisions = [
             self.decide(
@@ -713,6 +720,84 @@ class PolicyGate:
             "deny": sum(1 for d in decisions if d["effect"] == "deny"),
         }
         return {"decisions": decisions, "summary": summary}
+
+    def compare(self, candidate, requests):
+        """Compare this gate (the baseline) against ``candidate`` on one batch.
+
+        The two gates each apply their own glob matching, explicit-deny,
+        priority, declaration-order and default-deny rules to the same
+        requests; the point of the comparison is to locate exactly what a
+        candidate policy change alters.
+
+        ``candidate`` must be a :class:`PolicyGate`, otherwise ``TypeError``
+        is raised. ``requests`` uses the same list/tuple of request
+        mappings as :meth:`decide_many` and is validated exactly the same
+        way (:class:`PolicyBatchError` with ``code``/``index``/``field``;
+        the first error aborts the whole comparison with no partial
+        results). Validation of ``candidate`` and the whole batch finishes
+        before either gate evaluates anything. An empty batch returns an
+        all-zero summary and no changes.
+
+        Returns ``{"changes": [...], "summary": {"total", "unchanged",
+        "changed", "allow_to_deny", "deny_to_allow", "winner_changed"}}``.
+        ``total`` is the request count; each change is listed in input
+        order as ``{"index", "before", "after", "kind"}``, where
+        ``before``/``after`` are the full :meth:`decide` results of the
+        baseline and the candidate. ``kind`` is ``allow_to_deny`` or
+        ``deny_to_allow`` when the effect flips, and ``winner_changed``
+        when the effect is the same but the winning rule or reason
+        differs; identical results only count as ``unchanged``. The three
+        change kinds are disjoint, so ``changed`` is always their sum.
+
+        The comparison is read-only and offline: neither gate, request
+        mapping nor tag mapping is modified, no I/O happens, and repeated
+        calls return equal results.
+        """
+        if not isinstance(candidate, PolicyGate):
+            raise TypeError("candidate must be a PolicyGate instance")
+        self._validate_requests(requests)
+
+        changes = []
+        allow_to_deny = deny_to_allow = winner_changed = 0
+        for index, item in enumerate(requests):
+            before = self.decide(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            after = candidate.decide(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            if before == after:
+                continue
+            if before["effect"] != after["effect"]:
+                if after["effect"] == "deny":
+                    kind = "allow_to_deny"
+                    allow_to_deny += 1
+                else:
+                    kind = "deny_to_allow"
+                    deny_to_allow += 1
+            else:
+                kind = "winner_changed"
+                winner_changed += 1
+            changes.append(
+                {"index": index, "before": before, "after": after, "kind": kind}
+            )
+
+        changed = allow_to_deny + deny_to_allow + winner_changed
+        summary = {
+            "total": len(requests),
+            "unchanged": len(requests) - changed,
+            "changed": changed,
+            "allow_to_deny": allow_to_deny,
+            "deny_to_allow": deny_to_allow,
+            "winner_changed": winner_changed,
+        }
+        return {"changes": changes, "summary": summary}
 
     def explain(self, subject, action, resource, tags=None):
         """Read-only offline view of one decision and its full evidence.
