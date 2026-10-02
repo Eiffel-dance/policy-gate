@@ -28,3 +28,13 @@ Tests: python3 -m unittest discover -s tests -v
 - 直接构造的规则若含不能无损表示为严格 JSON 的值（元组、集合、非有限数字、含非字符串键的嵌套映射，或无法 UTF-8 编码的孤立代理项），`to_json` 与 `fingerprint` 均抛出消息含固定标识 `non_json_value` 的 `ValueError`，且不返回任何部分文本。
 - 快照功能纯离线：无文件、网络或其他外部 I/O。
 
+## 策略版本回归比较
+
+`base.compare(candidate, requests)` 把 `base` 作为基线、`candidate` 作为候选，对同一批请求分别按各自的规则判定并定位候选改动；两个 `PolicyGate` 互不影响，各自沿用通配、显式 deny、priority、声明顺序和默认 deny。
+
+- `requests` 与 `decide_many` 完全一致：list 或 tuple，元素为请求映射，`subject`、`action`、`resource` 为必填字符串，`tags` 可省略、为 `None` 或 mapping。比较前完整校验容器、元素、未知键、缺失键和类型，沿用 `PolicyBatchError` 的 `code`、`index`、`field`；第一处错误立即终止，绝不返回部分结果。`candidate` 不是 `PolicyGate` 时抛 `TypeError`。
+- 空批次返回 `{"changes": [], "summary": {"total": 0, "unchanged": 0, "changed": 0, "allow_to_deny": 0, "deny_to_allow": 0, "winner_changed": 0}}`。
+- 成功返回 `{"changes": [...], "summary": {"total", "unchanged", "changed", "allow_to_deny", "deny_to_allow", "winner_changed"}}`；`total` 为请求数，`changed` 等于三类变化计数之和，`changes` 按输入顺序只列出完整 `decide` 结果不同的请求。
+- 每项变化固定含 `index`、`before`、`after`、`kind`；`before`/`after` 分别是基线与候选的完整 `decide` 返回值。effect 从 allow 变 deny 为 `allow_to_deny`，从 deny 变 allow 为 `deny_to_allow`；effect 相同但 `rule` 或 `reason` 不同为 `winner_changed`；完全相同只计入 `unchanged`。
+- 比较纯离线：不修改任一 `PolicyGate`、请求或标签映射，不执行 I/O，重复调用结果相同；即使两版命中不同规则，也按完整结果（含 `reason`）报告。`decide`、`decide_many`、`explain`、`audit`、`from_json`、`to_json`、`fingerprint` 的既有行为不变。
+

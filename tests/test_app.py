@@ -1,6 +1,6 @@
 import unittest
 
-from app import PolicyConfigError, PolicyGate
+from app import PolicyBatchError, PolicyConfigError, PolicyGate
 
 
 class BackwardCompatTest(unittest.TestCase):
@@ -982,6 +982,230 @@ class SnapshotTest(unittest.TestCase):
         )
         for forbidden in ("open(", "socket", "urllib", "requests", "subprocess"):
             self.assertNotIn(forbidden, source)
+
+
+class CompareTest(unittest.TestCase):
+    def _baseline(self):
+        return PolicyGate(
+            [
+                {"id": "read", "effect": "allow", "action": "read"},
+                {"id": "prod-lock", "effect": "deny", "resource": "prod/*"},
+            ]
+        )
+
+    def _requests(self):
+        return [
+            {"subject": "alice", "action": "read", "resource": "dev/db"},
+            {"subject": "alice", "action": "read", "resource": "prod/db"},
+            {"subject": "alice", "action": "write", "resource": "x"},
+            {"subject": "bob", "action": "read", "resource": "dev/y",
+             "tags": {"env": "dev"}},
+        ]
+
+    def test_empty_batch_is_all_zero(self):
+        gate = self._baseline()
+        self.assertEqual(
+            gate.compare(PolicyGate([]), []),
+            {
+                "changes": [],
+                "summary": {
+                    "total": 0,
+                    "unchanged": 0,
+                    "changed": 0,
+                    "allow_to_deny": 0,
+                    "deny_to_allow": 0,
+                    "winner_changed": 0,
+                },
+            },
+        )
+
+    def test_effect_flips_and_winner_change(self):
+        baseline = self._baseline()
+        candidate = PolicyGate(
+            [{"id": "read2", "effect": "allow", "priority": 5,
+              "action": "read"}]
+        )
+        report = baseline.compare(candidate, self._requests())
+
+        self.assertEqual(
+            report["summary"],
+            {
+                "total": 4,
+                "unchanged": 1,
+                "changed": 3,
+                "allow_to_deny": 0,
+                "deny_to_allow": 1,
+                "winner_changed": 2,
+            },
+        )
+        self.assertEqual([c["index"] for c in report["changes"]], [0, 1, 3])
+        kinds = {c["index"]: c["kind"] for c in report["changes"]}
+        self.assertEqual(kinds, {0: "winner_changed", 1: "deny_to_allow",
+                                 3: "winner_changed"})
+
+        flip = report["changes"][1]
+        self.assertEqual(set(flip), {"index", "before", "after", "kind"})
+        self.assertEqual(flip["before"],
+                         baseline.decide("alice", "read", "prod/db"))
+        self.assertEqual(flip["after"],
+                         candidate.decide("alice", "read", "prod/db"))
+        self.assertEqual(flip["before"]["effect"], "deny")
+        self.assertEqual(flip["after"]["effect"], "allow")
+
+    def test_allow_to_deny(self):
+        baseline = PolicyGate([{"id": "a", "effect": "allow"}])
+        candidate = PolicyGate([{"id": "d", "effect": "deny"}])
+        request = {"subject": "s", "action": "a", "resource": "r"}
+        report = baseline.compare(candidate, [request])
+        (change,) = report["changes"]
+        self.assertEqual(change["kind"], "allow_to_deny")
+        self.assertEqual(change["index"], 0)
+        self.assertEqual(
+            report["summary"],
+            {"total": 1, "unchanged": 0, "changed": 1,
+             "allow_to_deny": 1, "deny_to_allow": 0, "winner_changed": 0},
+        )
+
+    def test_reason_only_change_is_winner_changed(self):
+        baseline = PolicyGate(
+            [{"id": "x", "effect": "allow", "priority": 1}])
+        candidate = PolicyGate(
+            [{"id": "x", "effect": "allow", "priority": 2}])
+        request = {"subject": "s", "action": "a", "resource": "r"}
+        (change,) = baseline.compare(candidate, [request])["changes"]
+        self.assertEqual(change["kind"], "winner_changed")
+        self.assertEqual(change["before"]["rule"], change["after"]["rule"])
+        self.assertNotEqual(change["before"]["reason"],
+                            change["after"]["reason"])
+
+    def test_rule_change_with_same_effect_is_winner_changed(self):
+        baseline = PolicyGate([{"id": "first", "effect": "allow"}])
+        candidate = PolicyGate([{"id": "second", "effect": "allow"}])
+        request = {"subject": "s", "action": "a", "resource": "r"}
+        (change,) = baseline.compare(candidate, [request])["changes"]
+        self.assertEqual(change["kind"], "winner_changed")
+
+    def test_identical_gates_all_unchanged(self):
+        baseline = self._baseline()
+        candidate = self._baseline()
+        report = baseline.compare(candidate, self._requests())
+        self.assertEqual(report["changes"], [])
+        self.assertEqual(
+            report["summary"],
+            {"total": 4, "unchanged": 4, "changed": 0,
+             "allow_to_deny": 0, "deny_to_allow": 0, "winner_changed": 0},
+        )
+
+    def test_default_deny_on_both_sides_is_unchanged(self):
+        baseline = PolicyGate([])
+        candidate = PolicyGate(
+            [{"id": "only-bob", "effect": "allow", "subject": "bob"}])
+        request = {"subject": "alice", "action": "a", "resource": "r"}
+        report = baseline.compare(candidate, [request])
+        self.assertEqual(report["changes"], [])
+        self.assertEqual(report["summary"]["unchanged"], 1)
+
+    def test_tuple_batch_and_tags_none_accepted(self):
+        baseline = self._baseline()
+        candidate = self._baseline()
+        requests = tuple(self._requests()) + (
+            {"subject": "s", "action": "a", "resource": "r", "tags": None},
+        )
+        report = baseline.compare(candidate, requests)
+        self.assertEqual(report["summary"]["total"], 5)
+        self.assertEqual(report["changes"], [])
+
+    def test_candidate_must_be_policy_gate(self):
+        baseline = self._baseline()
+        for bad in (None, 1, 1.5, "gate", [], {}, True, object()):
+            with self.assertRaises(TypeError):
+                baseline.compare(bad, [])
+
+    def test_batch_validation_matches_decide_many(self):
+        baseline = self._baseline()
+        candidate = self._baseline()
+        cases = [
+            ({"subject": "s"}, "invalid_batch", None, None),
+            (["x"], "item_not_mapping", 0, None),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "bogus": 1}], "unknown_field", 0, "bogus"),
+            ([{"subject": "s", "action": "a"}], "missing_field", 0,
+             "resource"),
+            ([{"subject": 1, "action": "a", "resource": "r"}],
+             "invalid_field_type", 0, "subject"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "tags": "no"}], "invalid_field_type", 0, "tags"),
+            ([{"subject": "s", "action": "a", "resource": "r"}, 7],
+             "item_not_mapping", 1, None),
+        ]
+        for requests, code, index, field in cases:
+            with self.assertRaises(PolicyBatchError) as compare_ctx:
+                baseline.compare(candidate, requests)
+            with self.assertRaises(PolicyBatchError) as many_ctx:
+                baseline.decide_many(requests)
+            self.assertEqual(compare_ctx.exception.code, code)
+            self.assertEqual(compare_ctx.exception.index, index)
+            self.assertEqual(compare_ctx.exception.field, field)
+            self.assertEqual(
+                (many_ctx.exception.code, many_ctx.exception.index,
+                 many_ctx.exception.field),
+                (compare_ctx.exception.code, compare_ctx.exception.index,
+                 compare_ctx.exception.field),
+            )
+
+    def test_first_error_aborts_without_partial_results(self):
+        baseline = self._baseline()
+        candidate = self._baseline()
+        requests = [
+            {"subject": "s", "action": "a", "resource": "r"},
+            {"subject": "s", "action": "a"},  # missing resource
+        ]
+        with self.assertRaises(PolicyBatchError) as ctx:
+            baseline.compare(candidate, requests)
+        self.assertEqual(ctx.exception.code, "missing_field")
+        self.assertEqual(ctx.exception.index, 1)
+
+    def test_type_error_before_batch_validation(self):
+        baseline = self._baseline()
+        with self.assertRaises(TypeError):
+            baseline.compare("not-a-gate", {"subject": "s"})
+
+    def test_repeatable_and_read_only(self):
+        import copy
+
+        baseline = self._baseline()
+        candidate = PolicyGate(
+            [{"id": "read2", "effect": "allow", "priority": 5,
+              "action": "read"}]
+        )
+        requests = self._requests()
+        requests_copy = copy.deepcopy(requests)
+        baseline_copy = copy.deepcopy(baseline.rules)
+        candidate_copy = copy.deepcopy(candidate.rules)
+
+        first = baseline.compare(candidate, requests)
+        for _ in range(20):
+            self.assertEqual(baseline.compare(candidate, requests), first)
+        self.assertEqual(requests, requests_copy)
+        self.assertEqual(baseline.rules, baseline_copy)
+        self.assertEqual(candidate.rules, candidate_copy)
+
+        # returned decisions must not alias or corrupt either gate
+        first["changes"][0]["before"]["rule"] = "tampered"
+        again = baseline.compare(candidate, requests)
+        self.assertNotEqual(
+            again["changes"][0]["before"]["rule"], "tampered"
+        )
+
+    def test_other_apis_unchanged_after_compare(self):
+        baseline = self._baseline()
+        candidate = self._baseline()
+        requests = self._requests()
+        decisions_before = baseline.decide_many(requests)
+        audit_before = baseline.audit()
+        baseline.compare(candidate, requests)
+        self.assertEqual(baseline.decide_many(requests), decisions_before)
+        self.assertEqual(baseline.audit(), audit_before)
 
 
 if __name__ == "__main__":
