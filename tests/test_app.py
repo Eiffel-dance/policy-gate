@@ -547,5 +547,250 @@ class FromJsonTest(unittest.TestCase):
         )
 
 
+class AuditTest(unittest.TestCase):
+    def test_empty_rules_empty_report(self):
+        self.assertEqual(
+            PolicyGate([]).audit(),
+            {"findings": [], "summary": {"total": 0, "error": 0, "warning": 0}},
+        )
+
+    def test_no_overlap_empty_report(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "subject": "alice"},
+                {"id": "d", "effect": "deny", "subject": "bob"},
+            ]
+        )
+        self.assertEqual(
+            gate.audit(),
+            {"findings": [], "summary": {"total": 0, "error": 0, "warning": 0}},
+        )
+
+    def test_similar_but_disjoint_patterns_not_flagged(self):
+        disjoint_pairs = [
+            ("data/[0-9]*", "data/[a-z]*"),
+            ("a*", "b*"),
+            ("[!a]", "a"),
+            ("prod/?", "prod/xy"),
+            ("[z-a]", "*"),  # empty range never matches anything
+        ]
+        for first, second in disjoint_pairs:
+            gate = PolicyGate(
+                [
+                    {"id": "a", "effect": "allow", "resource": first},
+                    {"id": "d", "effect": "deny", "resource": second},
+                ]
+            )
+            self.assertEqual(
+                gate.audit()["findings"],
+                [],
+                "patterns %r and %r must not be reported as overlapping"
+                % (first, second),
+            )
+
+    def test_effect_overlap_error(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "resource": "data/*"},
+                {"id": "d1", "effect": "deny", "resource": "data/secret*"},
+            ]
+        )
+        report = gate.audit()
+        self.assertEqual(report["summary"], {"total": 1, "error": 1, "warning": 0})
+        (finding,) = report["findings"]
+        self.assertEqual(
+            finding,
+            {
+                "code": "effect_overlap",
+                "severity": "error",
+                "rule": "a1",
+                "other_rule": "d1",
+                "winner": "d1",
+                "shadowed": None,
+                "reason": finding["reason"],
+            },
+        )
+        self.assertIn("deny", finding["reason"])
+        self.assertIn("allow", finding["reason"])
+
+    def test_effect_overlap_winner_ignores_priority(self):
+        gate = PolicyGate(
+            [
+                {"id": "d1", "effect": "deny", "priority": -5, "action": "read"},
+                {"id": "a1", "effect": "allow", "priority": 100, "action": "r*"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+        # rule/other_rule follow declaration order, not effect or priority
+        self.assertEqual(finding["rule"], "d1")
+        self.assertEqual(finding["other_rule"], "a1")
+        self.assertEqual(finding["winner"], "d1")
+        self.assertIsNone(finding["shadowed"])
+
+    def test_shadowed_allow_by_deny_is_error(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "priority": 10, "action": "read"},
+                {"id": "d1", "effect": "deny", "priority": -1, "action": "read"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "shadowed_rule")
+        self.assertEqual(finding["severity"], "error")
+        self.assertEqual(finding["winner"], "d1")
+        self.assertEqual(finding["shadowed"], "a1")
+
+    def test_shadowed_same_effect_is_warning(self):
+        gate = PolicyGate(
+            [
+                {"id": "first", "effect": "allow", "action": "read"},
+                {"id": "second", "effect": "allow", "action": "read"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "shadowed_rule")
+        self.assertEqual(finding["severity"], "warning")
+        self.assertEqual(finding["winner"], "first")
+        self.assertEqual(finding["shadowed"], "second")
+
+    def test_shadowed_same_effect_uses_priority(self):
+        gate = PolicyGate(
+            [
+                {"id": "low", "effect": "deny", "priority": 1},
+                {"id": "high", "effect": "deny", "priority": 9},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["severity"], "warning")
+        self.assertEqual(finding["winner"], "high")
+        self.assertEqual(finding["shadowed"], "low")
+
+    def test_same_effect_partial_overlap_no_finding(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*"},
+                {"id": "b", "effect": "allow", "resource": "data/x*"},
+                {"id": "c", "effect": "deny", "resource": "a*"},
+                {"id": "d", "effect": "deny", "resource": "ab*"},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_tag_conflict_prevents_overlap(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"env": "prod"}},
+                {"id": "d", "effect": "deny", "tags": {"env": "dev"}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_disjoint_tag_keys_still_overlap(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"env": "prod"}},
+                {"id": "d", "effect": "deny", "tags": {"team": "sec"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+
+    def test_glob_semantics_in_overlap(self):
+        # 'a?c' and 'abc' both match "abc"; '?' and '[!x]' share characters
+        for first, second in (("a?c", "abc"), ("?", "[!x]"), ("a*", "*b")):
+            gate = PolicyGate(
+                [
+                    {"id": "a", "effect": "allow", "action": first},
+                    {"id": "d", "effect": "deny", "action": second},
+                ]
+            )
+            (finding,) = gate.audit()["findings"]
+            self.assertEqual(finding["code"], "effect_overlap")
+
+    def test_summary_counts_and_stable_order(self):
+        gate = PolicyGate(
+            [
+                {"id": "r0", "effect": "allow", "action": "read"},
+                {"id": "r1", "effect": "deny", "action": "r*"},
+                {"id": "r2", "effect": "allow", "action": "read"},
+                {"id": "r3", "effect": "deny", "resource": "x"},
+                {"id": "r4", "effect": "deny", "resource": "x"},
+            ]
+        )
+        report = gate.audit()
+        pairs = [(f["rule"], f["other_rule"]) for f in report["findings"]]
+        self.assertEqual(pairs, sorted(pairs))
+        self.assertEqual(len(pairs), len(set(pairs)))
+        self.assertEqual(
+            report["summary"],
+            {
+                "total": len(report["findings"]),
+                "error": sum(
+                    1 for f in report["findings"] if f["severity"] == "error"
+                ),
+                "warning": sum(
+                    1 for f in report["findings"] if f["severity"] == "warning"
+                ),
+            },
+        )
+        self.assertGreater(report["summary"]["error"], 0)
+        self.assertGreater(report["summary"]["warning"], 0)
+
+    def test_audit_is_read_only_and_decisions_unchanged(self):
+        rules = [
+            {"id": "a1", "effect": "allow", "priority": 5, "resource": "data/*"},
+            {"id": "d1", "effect": "deny", "resource": "data/secret*"},
+            {"id": "a2", "effect": "allow", "resource": "data/*"},
+        ]
+        gate = PolicyGate(rules)
+        before = [dict(r) for r in gate.rules]
+        decisions_before = gate.decide_many(
+            [
+                {"subject": "s", "action": "read", "resource": "data/x"},
+                {"subject": "s", "action": "read", "resource": "data/secret1"},
+            ]
+        )
+        first = gate.audit()
+        for _ in range(5):
+            self.assertEqual(gate.audit(), first)
+        self.assertEqual(gate.rules, before)
+        self.assertEqual(
+            gate.decide_many(
+                [
+                    {"subject": "s", "action": "read", "resource": "data/x"},
+                    {"subject": "s", "action": "read", "resource": "data/secret1"},
+                ]
+            ),
+            decisions_before,
+        )
+        self.assertEqual(
+            gate.decide("s", "read", "data/x"),
+            {"effect": "allow", "rule": "a1",
+             "reason": "matched allow rule 'a1' (priority 5)"},
+        )
+
+    def test_audit_matches_from_json_gate(self):
+        document = (
+            '[{"id": "read", "effect": "allow", "action": "read"},'
+            '{"effect": "deny", "resource": "secret/*", "tags": {"env": "prod"}}]'
+        )
+        gate = PolicyGate.from_json(document)
+        legacy = PolicyGate(
+            [
+                {"id": "read", "effect": "allow", "action": "read"},
+                {"effect": "deny", "resource": "secret/*", "tags": {"env": "prod"}},
+            ]
+        )
+        self.assertEqual(gate.audit(), legacy.audit())
+        # read-anything allow vs secret/* prod deny overlap on e.g. a
+        # prod read of secret/x; the deny rule (default id "1") wins
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+        self.assertEqual(finding["rule"], "read")
+        self.assertEqual(finding["other_rule"], "1")
+        self.assertEqual(finding["winner"], "1")
+
+
 if __name__ == "__main__":
     unittest.main()
