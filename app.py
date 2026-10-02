@@ -1,5 +1,7 @@
 import fnmatch
+import hashlib
 import json
+import math
 from collections.abc import Mapping
 
 _ALLOWED_FIELDS = frozenset(
@@ -73,6 +75,72 @@ def _reject_duplicate_keys(pairs):
 def _reject_constant(value):
     # json.loads accepts NaN/Infinity by default; strict JSON does not.
     raise ValueError("invalid JSON constant %r" % value)
+
+
+def _json_snapshot_error(kind):
+    return ValueError("[non_json_value] rule snapshot contains %s" % kind)
+
+
+class _FixedObject:
+    """A JSON object whose keys must appear in a fixed order."""
+
+    __slots__ = ("pairs",)
+
+    def __init__(self, pairs):
+        self.pairs = pairs
+
+
+def _canonical_json(value):
+    """Serialize normalized rule data to canonical strict-JSON text.
+
+    Serialization is canonical: ``_FixedObject`` keeps its declared key
+    order (used for rule-level fields), while plain mappings emit their
+    string keys in Unicode code-point order at every nesting level.
+
+    Values are restricted to strict JSON types: tuples and sets are
+    rejected even though Python treats them as containers, non-finite
+    numbers are rejected (strict JSON has no NaN/Infinity), and lone
+    surrogates are rejected because the resulting text could not be
+    encoded as UTF-8 for fingerprinting. Raises ValueError tagged
+    ``non_json_value`` and never returns partially built text.
+    """
+    if value is None or isinstance(value, bool):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if isinstance(value, str):
+        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            raise _json_snapshot_error("a string with a lone surrogate")
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise _json_snapshot_error("a non-finite number")
+        return json.dumps(value, separators=(",", ":"), allow_nan=False)
+    if isinstance(value, _FixedObject):
+        return "{" + ",".join(
+            _canonical_json(key) + ":" + _canonical_json(val)
+            for key, val in value.pairs
+        ) + "}"
+    if isinstance(value, Mapping):
+        keys = list(value.keys())
+        for key in keys:
+            if not isinstance(key, str):
+                raise _json_snapshot_error("a mapping with a non-string key")
+        parts = []
+        for key in sorted(keys):
+            parts.append(_canonical_json(key) + ":" + _canonical_json(value[key]))
+        return "{" + ",".join(parts) + "}"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if isinstance(value, (tuple, set, frozenset)):
+            raise _json_snapshot_error(
+                "a %s, which has no JSON representation"
+                % type(value).__name__
+            )
+        return "[" + ",".join(_canonical_json(v) for v in value) + "]"
+    raise _json_snapshot_error(
+        "a value of type %s, which has no JSON representation"
+        % type(value).__name__
+    )
 
 
 # --- static pattern analysis (used by PolicyGate.audit) ------------------
@@ -459,6 +527,65 @@ class PolicyGate:
                 )
 
         return cls(rules)
+
+    # --- canonical snapshot export ------------------------------------
+
+    _SNAPSHOT_FIELDS = (
+        "id",
+        "effect",
+        "priority",
+        "subject",
+        "action",
+        "resource",
+        "tags",
+    )
+
+    def _snapshot(self):
+        """Normalized rules ready for canonical JSON serialization.
+
+        Only the seven effective fields are copied, in fixed order, so the
+        internal ``_index`` never leaks; the copy is shallow, and only read
+        by the serializer, so neither the rules nor caller-provided
+        mappings are mutated.
+        """
+        return [
+            _FixedObject([(field, rule[field]) for field in self._SNAPSHOT_FIELDS])
+            for rule in self.rules
+        ]
+
+    def to_json(self):
+        """Export the loaded rules as canonical strict-JSON text.
+
+        The root value is an array preserving declaration order. Every
+        rule writes its normalized, actually-effective ``id``, ``effect``,
+        ``priority``, ``subject``, ``action``, ``resource`` and ``tags``
+        in that fixed order, so all defaults appear explicitly and no
+        internal index leaks. Tag objects (at every nesting level) have
+        their keys sorted by Unicode code point; separators are compact
+        and non-ASCII characters are emitted unescaped. An empty rule set
+        exports as ``[]`` and repeated calls return identical text while
+        the rules are unchanged.
+
+        The result reloads losslessly through :meth:`from_json` with
+        identical decide/explain/decide_many/audit behavior. A value that
+        cannot be represented losslessly in strict JSON (a tuple, set,
+        non-finite number, nested mapping with non-string keys, or a
+        string that cannot be UTF-8 encoded) raises ``ValueError`` whose
+        message carries the fixed tag ``non_json_value``; no partial text
+        is returned. Performs no I/O.
+        """
+        return _canonical_json(self._snapshot())
+
+    def fingerprint(self):
+        """SHA-256 hex digest of the canonical snapshot's UTF-8 bytes.
+
+        Uses exactly the same snapshot as :meth:`to_json`, so digest and
+        text always agree; the result is a 64-character lowercase hex
+        string. A snapshot that cannot be serialized or UTF-8 encoded
+        raises the same ``ValueError`` tagged ``non_json_value``.
+        Performs no I/O.
+        """
+        return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
 
     @staticmethod
     def _matches(rule, subject, action, resource, tags):
