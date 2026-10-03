@@ -675,9 +675,9 @@ class PolicyGate:
 
     @staticmethod
     def _validate_requests(requests):
-        # Shared by decide_many() and compare(): the whole batch is checked
-        # before any decision is computed, so a malformed batch never
-        # produces partial results.
+        # Shared by decide_many(), compare() and coverage(): the whole
+        # batch is checked before any decision is computed, so a malformed
+        # batch never produces partial results.
         if not isinstance(requests, (list, tuple)):
             raise PolicyBatchError("invalid_batch", None)
 
@@ -720,6 +720,85 @@ class PolicyGate:
             "deny": sum(1 for d in decisions if d["effect"] == "deny"),
         }
         return {"decisions": decisions, "summary": summary}
+
+    def coverage(self, requests):
+        """Measure how the loaded rules participate in deciding a batch.
+
+        ``requests`` uses the same list/tuple of request mappings as
+        :meth:`decide_many` and is validated exactly the same way: the
+        whole batch is checked first, and a malformed batch raises
+        :class:`PolicyBatchError` with ``code``/``index``/``field``
+        instead of producing a partial report.
+
+        Returns ``{"rules": [...], "summary": {...}}``. ``rules`` lists
+        every loaded rule in declaration order as ``{"id", "effect",
+        "matched", "winner"}``: ``matched`` counts the requests whose
+        subject/action/resource matched the rule's glob patterns under
+        ``fnmatch.fnmatchcase`` semantics together with its exact tag
+        constraints, and ``winner`` counts the requests the rule
+        actually decided after explicit-deny precedence, priority and
+        declaration-order tie-breaking. A request matching several rules
+        raises every matched rule's ``matched`` but only the final
+        rule's ``winner``; a request falling through to the default deny
+        raises no rule's ``winner``.
+
+        ``summary`` has the fixed keys ``total``, ``allow``,
+        ``explicit_deny``, ``default_deny`` and ``matched_request``:
+        ``allow`` counts requests whose final effect is allow,
+        ``explicit_deny`` counts requests won by a deny rule,
+        ``default_deny`` counts requests that matched no rule at all,
+        and ``matched_request`` counts requests matching at least one
+        rule. An empty batch yields all-zero counts; with an empty rule
+        set every request lands in ``default_deny``.
+
+        The report is read-only and offline: rules and caller mappings
+        are never modified, no I/O happens, and repeated calls over the
+        same batch return equal results.
+        """
+        self._validate_requests(requests)
+
+        matched_counts = [0] * len(self.rules)
+        winner_counts = [0] * len(self.rules)
+        index_by_id = {r["id"]: r["_index"] for r in self.rules}
+        allow = explicit_deny = default_deny = matched_request = 0
+
+        for item in requests:
+            decision, matched = self._evaluate(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            for rule in matched:
+                matched_counts[rule["_index"]] += 1
+            if matched:
+                matched_request += 1
+            if decision["rule"] is None:
+                default_deny += 1
+            else:
+                winner_counts[index_by_id[decision["rule"]]] += 1
+                if decision["effect"] == "allow":
+                    allow += 1
+                else:
+                    explicit_deny += 1
+
+        rules = [
+            {
+                "id": rule["id"],
+                "effect": rule["effect"],
+                "matched": matched_counts[rule["_index"]],
+                "winner": winner_counts[rule["_index"]],
+            }
+            for rule in self.rules
+        ]
+        summary = {
+            "total": len(requests),
+            "allow": allow,
+            "explicit_deny": explicit_deny,
+            "default_deny": default_deny,
+            "matched_request": matched_request,
+        }
+        return {"rules": rules, "summary": summary}
 
     def compare(self, candidate, requests):
         """Compare this gate (the baseline) against ``candidate`` on one batch.

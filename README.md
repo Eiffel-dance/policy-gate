@@ -37,3 +37,12 @@ Tests: python3 -m unittest discover -s tests -v
 - `changes` 按输入顺序列出完整 `decide` 结果不同的请求，每项含 `index`、`before`、`after`、`kind`：effect 从 allow 变 deny / deny 变 allow 时 `kind` 分别为 `allow_to_deny` / `deny_to_allow`；effect 相同但 `rule` 或 `reason` 改变时为 `winner_changed`；完全相同只计入 `unchanged`。
 - 比较只读且纯离线：不修改任一 gate、请求或标签映射，无 I/O，重复调用结果相同；不改变 `decide`、`decide_many`、`explain`、`audit`、`from_json`、`to_json`、`fingerprint` 的既有行为。
 
+## 请求覆盖报告
+
+`PolicyGate.coverage(requests)` 用一批请求检查每条规则是否参与判定及赢得多少次，纯离线、只读，不改变任何判定结果。
+
+- `requests` 沿用 `decide_many` 的边界：只接受 list 或 tuple，每项是含 `subject`、`action`、`resource` 字符串、可选 `tags` 的映射。整批先校验；未知字段、缺少字段、字段类型错误、非映射元素或批次容器错误均抛 `PolicyBatchError`（保留 `code`、`index`、`field`），不返回部分报告。
+- 返回 `{"rules": [...], "summary": {...}}`。`rules` 按声明顺序列出每条规则的 `id`、`effect`、`matched`、`winner`：`matched` 是选择器（`fnmatch.fnmatchcase` 通配 + 标签精确约束）与请求匹配的次数，`winner` 是经显式 deny 优先、同效果按 priority 再按声明顺序决胜后最终胜出的次数。同一请求命中多条规则时所有命中规则的 `matched` 都计数，只有最终规则的 `winner` 计数；落入默认拒绝不增加任何规则的 `winner`。
+- `summary` 固定含 `total`、`allow`、`explicit_deny`、`default_deny`、`matched_request`：`allow` 为最终效果为 allow 的请求数，`explicit_deny` 为由 deny 规则赢得的请求数，`default_deny` 为无匹配规则落入默认拒绝的请求数，`matched_request` 为至少命中一条规则的请求数。空批次返回全零计数；空规则集按请求数统计 `default_deny`。
+- 报告结构及字段顺序稳定，重复调用得到相同值；不修改规则或调用方映射，不进行 I/O。
+

@@ -1258,5 +1258,280 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(report["changes"][0]["after"]["rule"], "prod-lock")
 
 
+class CoverageTest(unittest.TestCase):
+    def _gate(self):
+        return PolicyGate(
+            [
+                {"id": "r-low", "effect": "allow", "priority": -1,
+                 "action": "read"},
+                {"id": "r-high", "effect": "allow", "priority": 10,
+                 "action": "read"},
+                {"id": "d-prod", "effect": "deny", "resource": "prod/*"},
+                {"id": "tagged", "effect": "allow", "tags": {"env": "prod"}},
+                {"id": "miss", "effect": "allow", "subject": "nobody"},
+            ]
+        )
+
+    def test_report_structure_and_counts(self):
+        gate = self._gate()
+        requests = [
+            # matches r-low, r-high, tagged; r-high wins -> allow
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "tags": {"env": "prod"}},
+            # matches r-low, r-high, d-prod; explicit deny wins
+            {"subject": "bob", "action": "read", "resource": "prod/db"},
+            # matches nothing -> default deny
+            {"subject": "carol", "action": "write", "resource": "x"},
+        ]
+        report = gate.coverage(requests)
+        self.assertEqual(set(report), {"rules", "summary"})
+        self.assertEqual(
+            report["rules"],
+            [
+                {"id": "r-low", "effect": "allow", "matched": 2, "winner": 0},
+                {"id": "r-high", "effect": "allow", "matched": 2, "winner": 1},
+                {"id": "d-prod", "effect": "deny", "matched": 1, "winner": 1},
+                {"id": "tagged", "effect": "allow", "matched": 1, "winner": 0},
+                {"id": "miss", "effect": "allow", "matched": 0, "winner": 0},
+            ],
+        )
+        self.assertEqual(
+            report["summary"],
+            {
+                "total": 3,
+                "allow": 1,
+                "explicit_deny": 1,
+                "default_deny": 1,
+                "matched_request": 2,
+            },
+        )
+
+    def test_rule_fields_and_order_stable(self):
+        gate = self._gate()
+        report = gate.coverage(
+            [{"subject": "s", "action": "read", "resource": "r"}]
+        )
+        self.assertEqual(
+            [r["id"] for r in report["rules"]],
+            ["r-low", "r-high", "d-prod", "tagged", "miss"],
+        )
+        for entry in report["rules"]:
+            self.assertEqual(list(entry), ["id", "effect", "matched", "winner"])
+
+    def test_empty_batch_is_all_zero(self):
+        gate = self._gate()
+        report = gate.coverage([])
+        self.assertEqual(
+            report["summary"],
+            {
+                "total": 0,
+                "allow": 0,
+                "explicit_deny": 0,
+                "default_deny": 0,
+                "matched_request": 0,
+            },
+        )
+        self.assertEqual(len(report["rules"]), 5)
+        for entry in report["rules"]:
+            self.assertEqual(entry["matched"], 0)
+            self.assertEqual(entry["winner"], 0)
+
+    def test_empty_rule_set_counts_default_deny(self):
+        gate = PolicyGate([])
+        requests = [
+            {"subject": "s", "action": "a", "resource": "r"},
+            {"subject": "t", "action": "b", "resource": "x"},
+        ]
+        report = gate.coverage(requests)
+        self.assertEqual(report["rules"], [])
+        self.assertEqual(
+            report["summary"],
+            {
+                "total": 2,
+                "allow": 0,
+                "explicit_deny": 0,
+                "default_deny": 2,
+                "matched_request": 0,
+            },
+        )
+
+    def test_tuple_batch_accepted(self):
+        gate = self._gate()
+        report = gate.coverage(
+            ({"subject": "s", "action": "read", "resource": "r"},)
+        )
+        self.assertEqual(report["summary"]["total"], 1)
+        self.assertEqual(report["summary"]["allow"], 1)
+
+    def test_tags_omitted_none_and_mapping(self):
+        gate = PolicyGate(
+            [{"id": "tagged", "effect": "allow", "tags": {"env": "prod"}}]
+        )
+        requests = [
+            {"subject": "s", "action": "a", "resource": "r", "tags": None},
+            {"subject": "s", "action": "a", "resource": "r"},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod"}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod", "extra": 1}},
+        ]
+        report = gate.coverage(requests)
+        self.assertEqual(report["rules"][0]["matched"], 2)
+        self.assertEqual(report["rules"][0]["winner"], 2)
+        self.assertEqual(report["summary"]["allow"], 2)
+        self.assertEqual(report["summary"]["default_deny"], 2)
+
+    def test_explicit_deny_beats_higher_priority_allow(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "priority": 100},
+                {"id": "d1", "effect": "deny", "priority": -5},
+            ]
+        )
+        report = gate.coverage(
+            [{"subject": "s", "action": "a", "resource": "r"}]
+        )
+        self.assertEqual(
+            report["rules"],
+            [
+                {"id": "a1", "effect": "allow", "matched": 1, "winner": 0},
+                {"id": "d1", "effect": "deny", "matched": 1, "winner": 1},
+            ],
+        )
+        self.assertEqual(report["summary"]["explicit_deny"], 1)
+        self.assertEqual(report["summary"]["allow"], 0)
+
+    def test_priority_then_declaration_order_tiebreak(self):
+        gate = PolicyGate(
+            [
+                {"id": "low", "effect": "allow", "priority": 1},
+                {"id": "high", "effect": "allow", "priority": 10},
+                {"id": "also-high", "effect": "allow", "priority": 10},
+            ]
+        )
+        report = gate.coverage(
+            [{"subject": "s", "action": "a", "resource": "r"}] * 3
+        )
+        self.assertEqual(
+            [r["winner"] for r in report["rules"]], [0, 3, 0]
+        )
+        self.assertEqual(
+            [r["matched"] for r in report["rules"]], [3, 3, 3]
+        )
+
+    def test_fnmatchcase_semantics_used(self):
+        gate = PolicyGate(
+            [{"id": "a", "effect": "allow", "action": "read"}]
+        )
+        report = gate.coverage(
+            [
+                {"subject": "s", "action": "read", "resource": "r"},
+                {"subject": "s", "action": "READ", "resource": "r"},
+            ]
+        )
+        self.assertEqual(report["rules"][0]["matched"], 1)
+        self.assertEqual(report["summary"]["default_deny"], 1)
+
+    def test_batch_validation_matches_decide_many(self):
+        gate = self._gate()
+        cases = [
+            ("nope", "invalid_batch", None, None),
+            (["x"], "item_not_mapping", 0, None),
+            ([{"action": "a", "resource": "r"}],
+             "missing_field", 0, "subject"),
+            ([{"subject": 1, "action": "a", "resource": "r"}],
+             "invalid_field_type", 0, "subject"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "bogus": 1}], "unknown_field", 0, "bogus"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "tags": "k=v"}], "invalid_field_type", 0, "tags"),
+        ]
+        for requests, code, index, field in cases:
+            with self.subTest(requests=requests):
+                with self.assertRaises(PolicyBatchError) as ctx:
+                    gate.coverage(requests)
+                self.assertEqual(ctx.exception.code, code)
+                self.assertEqual(ctx.exception.index, index)
+                self.assertEqual(ctx.exception.field, field)
+                with self.assertRaises(PolicyBatchError):
+                    gate.decide_many(requests)
+
+    def test_first_error_aborts_with_no_partial_report(self):
+        gate = self._gate()
+        good = {"subject": "s", "action": "read", "resource": "r"}
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.coverage([good, {"subject": "s", "bogus": 1}])
+        self.assertEqual(ctx.exception.index, 1)
+        self.assertEqual(ctx.exception.code, "unknown_field")
+
+    def test_coverage_is_read_only_and_repeatable(self):
+        import copy
+
+        gate = self._gate()
+        requests = [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "tags": {"env": "prod"}},
+            {"subject": "bob", "action": "read", "resource": "prod/db"},
+            {"subject": "carol", "action": "write", "resource": "x"},
+        ]
+        requests_snapshot = copy.deepcopy(requests)
+        rules_before = [dict(r) for r in gate.rules]
+        first = gate.coverage(requests)
+        for _ in range(20):
+            self.assertEqual(gate.coverage(copy.deepcopy(requests)), first)
+        self.assertEqual(requests, requests_snapshot)
+        self.assertEqual([dict(r) for r in gate.rules], rules_before)
+        # mutating a returned report must not affect later calls
+        first["rules"][0]["matched"] = 999
+        first["summary"]["total"] = 999
+        fresh = gate.coverage(requests)
+        self.assertEqual(fresh["rules"][0]["matched"], 2)
+        self.assertEqual(fresh["summary"]["total"], 3)
+
+    def test_counts_agree_with_decide_many(self):
+        gate = self._gate()
+        requests = [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "tags": {"env": "prod"}},
+            {"subject": "bob", "action": "read", "resource": "prod/db"},
+            {"subject": "carol", "action": "write", "resource": "x"},
+            {"subject": "nobody", "action": "delete", "resource": "y"},
+        ]
+        coverage = gate.coverage(requests)
+        decisions = gate.decide_many(requests)["decisions"]
+        self.assertEqual(
+            coverage["summary"]["allow"],
+            sum(1 for d in decisions if d["effect"] == "allow"),
+        )
+        self.assertEqual(
+            coverage["summary"]["explicit_deny"]
+            + coverage["summary"]["default_deny"],
+            sum(1 for d in decisions if d["effect"] == "deny"),
+        )
+        self.assertEqual(
+            coverage["summary"]["default_deny"],
+            sum(1 for d in decisions if d["rule"] is None),
+        )
+        # every winner count matches the decisions' winning rule ids
+        for entry in coverage["rules"]:
+            self.assertEqual(
+                entry["winner"],
+                sum(1 for d in decisions if d["rule"] == entry["id"]),
+            )
+
+    def test_from_json_gate_coverage_matches_constructor(self):
+        rules = [
+            {"id": "read", "effect": "allow", "action": "read"},
+            {"id": "prod-lock", "effect": "deny", "resource": "prod/*"},
+        ]
+        gate = PolicyGate(rules)
+        reloaded = PolicyGate.from_json(gate.to_json())
+        requests = [
+            {"subject": "alice", "action": "read", "resource": "prod/db"},
+            {"subject": "alice", "action": "read", "resource": "dev/db"},
+        ]
+        self.assertEqual(gate.coverage(requests), reloaded.coverage(requests))
+
+
 if __name__ == "__main__":
     unittest.main()
