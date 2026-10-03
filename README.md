@@ -46,3 +46,12 @@ Tests: python3 -m unittest discover -s tests -v
 - `summary` 固定含 `total`、`allow`、`explicit_deny`、`default_deny`、`matched_request`：`allow` 为最终效果为 allow 的请求数，`explicit_deny` 为由 deny 规则赢得的请求数，`default_deny` 为无匹配规则落入默认拒绝的请求数，`matched_request` 为至少命中一条规则的请求数。空批次返回全零计数；空规则集按请求数统计 `default_deny`。
 - 报告结构及字段顺序稳定，重复调用得到相同值；不修改规则或调用方映射，不进行 I/O。
 
+## 逐规则判定追踪
+
+`PolicyGate.trace(subject, action, resource, tags=None)` 在保留 `decide` 判定结果的基础上，附带给定请求对每条规则的逐项匹配细节，供离线审查；`PolicyGate.trace_many(requests)` 生成批量追踪。
+
+- 输入校验与 `decide` 完全一致（非法主体/动作/资源/标签类型抛同样的 `TypeError`）；返回映射的根级 `effect`、`rule`、`reason` 与 `decide` 结果逐项相等，并附 `evaluations` 数组。
+- `evaluations` 按声明顺序覆盖所有规则，每项按固定顺序给出 `id`、`effect`、`priority`、`subject_match`、`action_match`、`resource_match`、`tags_match`、`matched`、`selected`：前三项用 `fnmatch.fnmatchcase` 比较，`tags_match` 使用现有标签精确约束（`tags=None` 视为空映射），`matched` 为四项合取，`selected` 仅最终胜出规则为真；默认拒绝时 `rule` 为 `None` 且所有 `selected` 为假。显式 deny、同效果的 priority 与声明顺序决胜、默认 deny 均沿用现有规则。
+- `trace_many` 的 `requests` 沿用 `decide_many` 的边界，整批先校验，首个错误抛原有 `PolicyBatchError`（带 `code`、`index`、`field`），不返回部分结果；成功返回 `{"traces": [...], "summary": {"total", "allow", "deny"}}`，`traces` 按输入顺序排列，计数与 `decide_many` 相同，空批次为全零。
+- 两个入口只读、纯离线：不修改规则或调用方映射，无网络和其他 I/O；直接构造和 `from_json` 加载的规则具有相同追踪语义，且不影响 `decide`、`decide_many`、`explain`、`audit`、`coverage`、`compare`、`from_json`、`to_json`、`fingerprint` 的既有行为。
+

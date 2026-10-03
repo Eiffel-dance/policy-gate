@@ -611,25 +611,22 @@ class PolicyGate:
             raise TypeError("tags must be a mapping or None")
         return tags
 
-    def _evaluate(self, subject, action, resource, tags):
-        """Shared decision core; returns (decision, matched rules in order)."""
-        tags = self._check_inputs(subject, action, resource, tags)
+    @staticmethod
+    def _select(matched):
+        """Pick the winning rule out of the matched ones.
 
-        matched = [
-            r
-            for r in self.rules
-            if self._matches(r, subject, action, resource, tags)
-        ]
+        Explicit deny always wins; within one effect, higher priority wins,
+        then the earliest declaration order breaks ties deterministically.
+        Returns (decision, winner rule or None).
+        """
         denies = [r for r in matched if r["effect"] == "deny"]
         allows = [r for r in matched if r["effect"] == "allow"]
 
-        # Explicit deny always wins; within one effect, higher priority wins,
-        # then the earliest declaration order breaks ties deterministically.
         winners = denies if denies else allows
         if not winners:
             return (
                 {"effect": "deny", "rule": None, "reason": "default deny"},
-                matched,
+                None,
             )
 
         winner = min(winners, key=lambda r: (-r["priority"], r["_index"]))
@@ -642,8 +639,20 @@ class PolicyGate:
             reason += "; explicit deny overrides allow"
         return (
             {"effect": winner["effect"], "rule": winner["id"], "reason": reason},
-            matched,
+            winner,
         )
+
+    def _evaluate(self, subject, action, resource, tags):
+        """Shared decision core; returns (decision, matched rules in order)."""
+        tags = self._check_inputs(subject, action, resource, tags)
+
+        matched = [
+            r
+            for r in self.rules
+            if self._matches(r, subject, action, resource, tags)
+        ]
+        decision, _winner = self._select(matched)
+        return decision, matched
 
     def decide(self, subject, action, resource, tags=None):
         result, _matched = self._evaluate(subject, action, resource, tags)
@@ -892,6 +901,95 @@ class PolicyGate:
             for r in matched
         ]
         return explanation
+
+    def trace(self, subject, action, resource, tags=None):
+        """Per-rule decision trace of one request, for offline review.
+
+        Shares decide()'s input validation and selection semantics: the
+        root ``effect``, ``rule`` and ``reason`` are exactly what
+        :meth:`decide` returns. Adds ``evaluations``, one entry per loaded
+        rule in declaration order, each with the fixed key order ``id``,
+        ``effect``, ``priority``, ``subject_match``, ``action_match``,
+        ``resource_match``, ``tags_match``, ``matched``, ``selected``.
+        The first three flags compare subject/action/resource against the
+        rule's glob patterns with ``fnmatch.fnmatchcase``; ``tags_match``
+        applies the rule's exact tag constraints (``tags=None`` counts as
+        an empty mapping). ``matched`` is the conjunction of the four
+        flags; ``selected`` is true only on the final winning rule, and
+        false everywhere when the request falls through to the default
+        deny (``rule`` is then ``None``).
+
+        Read-only and offline: the rule list and caller mappings are never
+        modified and no I/O happens.
+        """
+        tags = self._check_inputs(subject, action, resource, tags)
+
+        evaluations = []
+        matched = []
+        for r in self.rules:
+            subject_match = fnmatch.fnmatchcase(subject, r["subject"])
+            action_match = fnmatch.fnmatchcase(action, r["action"])
+            resource_match = fnmatch.fnmatchcase(resource, r["resource"])
+            tags_match = all(tags.get(k) == v for k, v in r["tags"].items())
+            rule_matched = (
+                subject_match and action_match and resource_match and tags_match
+            )
+            if rule_matched:
+                matched.append(r)
+            evaluations.append(
+                {
+                    "id": r["id"],
+                    "effect": r["effect"],
+                    "priority": r["priority"],
+                    "subject_match": subject_match,
+                    "action_match": action_match,
+                    "resource_match": resource_match,
+                    "tags_match": tags_match,
+                    "matched": rule_matched,
+                    "selected": False,
+                }
+            )
+
+        decision, winner = self._select(matched)
+        if winner is not None:
+            evaluations[winner["_index"]]["selected"] = True
+
+        result = dict(decision)
+        result["evaluations"] = evaluations
+        return result
+
+    def trace_many(self, requests):
+        """Batch counterpart of :meth:`trace`.
+
+        ``requests`` uses the same list/tuple of request mappings as
+        :meth:`decide_many` and is validated exactly the same way: the
+        whole batch is checked first, and the first malformed element
+        raises :class:`PolicyBatchError` with its ``code``/``index``/
+        ``field`` instead of producing partial results.
+
+        Returns ``{"traces": [...], "summary": {"total", "allow",
+        "deny"}}`` with one :meth:`trace` result per request in input
+        order; the summary counts match :meth:`decide_many` and an empty
+        batch yields all-zero counts. Read-only and offline: rules and
+        caller mappings are never modified and no I/O happens.
+        """
+        self._validate_requests(requests)
+
+        traces = [
+            self.trace(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            for item in requests
+        ]
+        summary = {
+            "total": len(traces),
+            "allow": sum(1 for t in traces if t["effect"] == "allow"),
+            "deny": sum(1 for t in traces if t["effect"] == "deny"),
+        }
+        return {"traces": traces, "summary": summary}
 
     def audit(self):
         """Offline pre-release review of the loaded rules.
