@@ -1,6 +1,6 @@
 import unittest
 
-from app import PolicyBatchError, PolicyConfigError, PolicyGate
+from app import PolicyBatchError, PolicyConfigError, PolicyGate, PolicyVerificationError
 
 
 class BackwardCompatTest(unittest.TestCase):
@@ -1933,6 +1933,369 @@ class CoverageTest(unittest.TestCase):
             {"subject": "alice", "action": "read", "resource": "dev/db"},
         ]
         self.assertEqual(gate.coverage(requests), reloaded.coverage(requests))
+
+
+class VerifyTest(unittest.TestCase):
+    def setUp(self):
+        self.gate = PolicyGate(
+            [
+                {"id": "read", "effect": "allow", "action": "read"},
+                {"id": "prod-lock", "effect": "deny", "resource": "prod/*"},
+            ]
+        )
+        self.cases = [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "expected": {"effect": "allow", "rule": "read"}},
+            {"subject": "alice", "action": "read", "resource": "prod/db",
+             "expected": {"effect": "deny", "rule": "prod-lock"}},
+            {"subject": "bob", "action": "write", "resource": "x",
+             "expected": {"effect": "deny", "rule": None}},
+        ]
+
+    def test_all_pass_structure(self):
+        report = self.gate.verify(self.cases)
+        self.assertEqual(set(report), {"ok", "failures", "summary"})
+        self.assertEqual(
+            report["summary"], {"total": 3, "passed": 3, "failed": 0}
+        )
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["failures"], [])
+
+    def test_empty_batch(self):
+        self.assertEqual(
+            self.gate.verify([]),
+            {
+                "ok": True,
+                "failures": [],
+                "summary": {"total": 0, "passed": 0, "failed": 0},
+            },
+        )
+        self.assertTrue(self.gate.verify(())["ok"])
+
+    def test_tuple_batch_accepted(self):
+        report = self.gate.verify(tuple(self.cases))
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["summary"]["total"], 3)
+
+    def test_failure_counts_and_order(self):
+        cases = [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "expected": {"effect": "allow", "rule": "other"}},
+            self.cases[0],
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "expected": {"effect": "deny", "rule": None}},
+        ]
+        report = self.gate.verify(cases)
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["summary"], {"total": 3, "passed": 1, "failed": 2}
+        )
+        self.assertEqual([f["index"] for f in report["failures"]], [0, 2])
+        first, second = report["failures"]
+        self.assertEqual(set(first), {"index", "expected", "actual"})
+        self.assertEqual(first["expected"], {"effect": "allow", "rule": "other"})
+        self.assertEqual(
+            first["actual"],
+            self.gate.decide("alice", "read", "dev/x"),
+        )
+        self.assertEqual(second["actual"]["effect"], "allow")
+
+    def test_reason_does_not_participate(self):
+        # effect+rule equal but reason differs is still a pass; actual is
+        # nevertheless the complete decision including reason
+        report = self.gate.verify(
+            [
+                {"subject": "alice", "action": "read", "resource": "dev/x",
+                 "expected": {"effect": "allow", "rule": "read"}},
+            ]
+        )
+        self.assertTrue(report["ok"])
+        # force a failure and inspect the carried full decision
+        bad = self.gate.verify(
+            [
+                {"subject": "alice", "action": "read", "resource": "dev/x",
+                 "expected": {"effect": "deny", "rule": None}},
+            ]
+        )
+        actual = bad["failures"][0]["actual"]
+        self.assertEqual(
+            actual,
+            {"effect": "allow", "rule": "read",
+             "reason": "matched allow rule 'read' (priority 0)"},
+        )
+
+    def test_same_effect_different_rule_fails(self):
+        gate = PolicyGate(
+            [
+                {"id": "low", "effect": "allow", "priority": 1},
+                {"id": "high", "effect": "allow", "priority": 9},
+            ]
+        )
+        report = gate.verify(
+            [
+                {"subject": "s", "action": "a", "resource": "r",
+                 "expected": {"effect": "allow", "rule": "low"}},
+            ]
+        )
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["failures"][0]["actual"]["rule"], "high")
+
+    def test_default_deny_expectation(self):
+        report = self.gate.verify(
+            [
+                {"subject": "bob", "action": "write", "resource": "x",
+                 "expected": {"effect": "deny", "rule": None}},
+            ]
+        )
+        self.assertTrue(report["ok"])
+        # expecting a rule id on a default-deny request fails
+        bad = self.gate.verify(
+            [
+                {"subject": "bob", "action": "write", "resource": "x",
+                 "expected": {"effect": "deny", "rule": "read"}},
+            ]
+        )
+        self.assertFalse(bad["ok"])
+        self.assertIsNone(bad["failures"][0]["actual"]["rule"])
+
+    def test_tags_omitted_none_and_mapping(self):
+        gate = PolicyGate(
+            [{"id": "tagged", "effect": "allow", "tags": {"env": "prod"}}]
+        )
+        cases = [
+            {"subject": "s", "action": "a", "resource": "r",
+             "expected": {"effect": "deny", "rule": None}},
+            {"subject": "s", "action": "a", "resource": "r", "tags": None,
+             "expected": {"effect": "deny", "rule": None}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod"},
+             "expected": {"effect": "allow", "rule": "tagged"}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod", "extra": 1},
+             "expected": {"effect": "allow", "rule": "tagged"}},
+        ]
+        self.assertTrue(gate.verify(cases)["ok"])
+
+    def test_explicit_deny_and_priority_semantics(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "priority": 100},
+                {"id": "d1", "effect": "deny", "priority": -5},
+            ]
+        )
+        report = gate.verify(
+            [
+                {"subject": "s", "action": "a", "resource": "r",
+                 "expected": {"effect": "deny", "rule": "d1"}},
+            ]
+        )
+        self.assertTrue(report["ok"])
+
+    def test_fnmatch_case_sensitive(self):
+        gate = PolicyGate(
+            [{"id": "a", "effect": "allow", "action": "read"}]
+        )
+        self.assertTrue(
+            gate.verify(
+                [
+                    {"subject": "s", "action": "read", "resource": "r",
+                     "expected": {"effect": "allow", "rule": "a"}},
+                    {"subject": "s", "action": "READ", "resource": "r",
+                     "expected": {"effect": "deny", "rule": None}},
+                ]
+            )["ok"]
+        )
+
+    # --- validation --------------------------------------------------
+
+    def _expect_error(self, cases, code, index, field):
+        with self.assertRaises(PolicyVerificationError) as ctx:
+            self.gate.verify(cases)
+        self.assertEqual(ctx.exception.code, code)
+        self.assertEqual(ctx.exception.index, index)
+        self.assertEqual(ctx.exception.field, field)
+        self.assertIn(code, str(ctx.exception))
+
+    def test_invalid_batch_type(self):
+        for bad in ("nope", None, 1, 1.5, set(), True, {}):
+            self._expect_error(bad, "invalid_cases", None, None)
+
+    def test_item_not_mapping(self):
+        self._expect_error(["x"], "item_not_mapping", 0, None)
+        self._expect_error([42], "item_not_mapping", 0, None)
+        self._expect_error([None], "item_not_mapping", 0, None)
+        good = {
+            "subject": "s", "action": "a", "resource": "r",
+            "expected": {"effect": "allow", "rule": None},
+        }
+        self._expect_error([good, ["not", "mapping"]], "item_not_mapping", 1, None)
+
+    def test_unknown_field(self):
+        self._expect_error(
+            [
+                {
+                    "subject": "s", "action": "a", "resource": "r",
+                    "expected": {"effect": "allow", "rule": None},
+                    "bogus": 1,
+                }
+            ],
+            "unknown_field", 0, "bogus",
+        )
+
+    def test_missing_required_fields(self):
+        self._expect_error(
+            [{"action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": None}}],
+            "missing_field", 0, "subject",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r"}],
+            "missing_field", 0, "expected",
+        )
+
+    def test_invalid_field_types(self):
+        self._expect_error(
+            [{"subject": 1, "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": None}}],
+            "invalid_field_type", 0, "subject",
+        )
+        self._expect_error(
+            [{"subject": None, "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": None}}],
+            "invalid_field_type", 0, "subject",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r", "tags": "k=v",
+              "expected": {"effect": "allow", "rule": None}}],
+            "invalid_field_type", 0, "tags",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": "x"}],
+            "invalid_field_type", 0, "expected",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": None}],
+            "invalid_field_type", 0, "expected",
+        )
+
+    def test_invalid_expectation_values(self):
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "maybe", "rule": None}}],
+            "invalid_expectation", 0, "expected.effect",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": None, "rule": None}}],
+            "invalid_expectation", 0, "expected.effect",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": True, "rule": None}}],
+            "invalid_expectation", 0, "expected.effect",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": 3}}],
+            "invalid_expectation", 0, "expected.rule",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": True}}],
+            "invalid_expectation", 0, "expected.rule",
+        )
+
+    def test_nested_expectation_fields(self):
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": None, "x": 1}}],
+            "unknown_field", 0, "expected.x",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"rule": None}}],
+            "missing_field", 0, "expected.effect",
+        )
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "allow"}}],
+            "missing_field", 0, "expected.rule",
+        )
+
+    def test_error_precedence_within_item(self):
+        # unknown top-level beats everything
+        self._expect_error(
+            [{"subject": 1, "bogus": 1,
+              "expected": {"effect": "bad"}}],
+            "unknown_field", 0, "bogus",
+        )
+        # missing top-level beats a bad type
+        self._expect_error(
+            [{"subject": 1, "action": "a",
+              "expected": {"effect": "allow", "rule": None}}],
+            "missing_field", 0, "resource",
+        )
+        # field type beats invalid expectation value
+        self._expect_error(
+            [{"subject": 1, "action": "a", "resource": "r",
+              "expected": {"effect": "bad", "rule": None}}],
+            "invalid_field_type", 0, "subject",
+        )
+        # nested missing beats invalid value too
+        self._expect_error(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "bad"}}],
+            "missing_field", 0, "expected.rule",
+        )
+
+    def test_first_error_aborts_with_no_partial_results(self):
+        good = {
+            "subject": "alice", "action": "read", "resource": "dev/x",
+            "expected": {"effect": "deny", "rule": None},  # would fail
+        }
+        self._expect_error(
+            [good, {"subject": "s", "bogus": 1}],
+            "unknown_field", 1, "bogus",
+        )
+
+    # --- read-only / repeatable -------------------------------------
+
+    def test_report_is_independent_deep_copy(self):
+        nested = {"env": {"k": ["v"]}}
+        gate = PolicyGate(
+            [{"id": "t", "effect": "allow", "tags": {"env": {"k": ["v"]}}}]
+        )
+        case = {
+            "subject": "s", "action": "a", "resource": "r", "tags": nested,
+            "expected": {"effect": "deny", "rule": None},
+        }
+        first = gate.verify([case])
+        first["failures"][0]["actual"]["rule"] = "tampered"
+        first["failures"][0]["expected"]["rule"] = "tampered"
+        fresh = gate.verify([case])
+        self.assertEqual(fresh["failures"][0]["actual"]["rule"], "t")
+        self.assertIsNone(fresh["failures"][0]["expected"]["rule"])
+        self.assertEqual(nested, {"env": {"k": ["v"]}})
+
+    def test_repeatable_and_read_only(self):
+        import copy
+
+        cases_snapshot = copy.deepcopy(self.cases)
+        rules_before = [dict(r) for r in self.gate.rules]
+        first = self.gate.verify(self.cases)
+        for _ in range(20):
+            self.assertEqual(self.gate.verify(copy.deepcopy(self.cases)), first)
+        self.assertEqual(self.cases, cases_snapshot)
+        self.assertEqual([dict(r) for r in self.gate.rules], rules_before)
+
+    def test_from_json_matches_constructor(self):
+        loaded = PolicyGate.from_json(
+            '[{"id": "read", "effect": "allow", "action": "read"},'
+            '{"id": "prod-lock", "effect": "deny", "resource": "prod/*"}]'
+        )
+        self.assertEqual(loaded.verify(self.cases), self.gate.verify(self.cases))
 
 
 if __name__ == "__main__":
