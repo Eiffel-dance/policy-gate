@@ -1,6 +1,11 @@
 import unittest
 
-from app import PolicyBatchError, PolicyConfigError, PolicyGate
+from app import (
+    PolicyBatchError,
+    PolicyConfigError,
+    PolicyGate,
+    PolicyVerificationError,
+)
 
 
 class BackwardCompatTest(unittest.TestCase):
@@ -1933,6 +1938,321 @@ class CoverageTest(unittest.TestCase):
             {"subject": "alice", "action": "read", "resource": "dev/db"},
         ]
         self.assertEqual(gate.coverage(requests), reloaded.coverage(requests))
+
+
+class VerifyTest(unittest.TestCase):
+    def _gate(self):
+        return PolicyGate(
+            [
+                {"id": "read", "effect": "allow", "action": "read"},
+                {"id": "prod-lock", "effect": "deny", "resource": "prod/*"},
+            ]
+        )
+
+    def _cases(self):
+        return [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "expected": {"effect": "allow", "rule": "read"}},
+            {"subject": "alice", "action": "read", "resource": "prod/db",
+             "expected": {"effect": "deny", "rule": "prod-lock"}},
+            {"subject": "bob", "action": "write", "resource": "x",
+             "expected": {"effect": "deny", "rule": None}},
+        ]
+
+    def test_all_pass_report(self):
+        gate = self._gate()
+        report = gate.verify(self._cases())
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(
+            report["summary"], {"total": 3, "passed": 3, "failed": 0}
+        )
+        self.assertEqual(set(report), {"ok", "failures", "summary"})
+        self.assertEqual(
+            set(report["summary"]), {"total", "passed", "failed"}
+        )
+
+    def test_empty_batch_is_ok_with_zero_summary(self):
+        report = self._gate().verify([])
+        self.assertEqual(
+            report,
+            {
+                "ok": True,
+                "failures": [],
+                "summary": {"total": 0, "passed": 0, "failed": 0},
+            },
+        )
+        self.assertEqual(self._gate().verify(())["ok"], True)
+
+    def test_tuple_batch_accepted(self):
+        report = self._gate().verify(tuple(self._cases()))
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["summary"]["total"], 3)
+
+    def test_default_deny_written_as_deny_null(self):
+        gate = PolicyGate([])
+        report = gate.verify(
+            [
+                {"subject": "s", "action": "a", "resource": "r",
+                 "expected": {"effect": "deny", "rule": None}},
+            ]
+        )
+        self.assertTrue(report["ok"])
+
+    def test_failures_follow_input_order_and_hold_full_decision(self):
+        gate = self._gate()
+        cases = [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "expected": {"effect": "allow", "rule": "read"}},
+            {"subject": "alice", "action": "read", "resource": "prod/db",
+             "expected": {"effect": "allow", "rule": "read"}},
+            {"subject": "bob", "action": "write", "resource": "x",
+             "expected": {"effect": "deny", "rule": None}},
+            {"subject": "carol", "action": "read", "resource": "dev/y",
+             "expected": {"effect": "deny", "rule": "prod-lock"}},
+        ]
+        report = gate.verify(cases)
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["summary"], {"total": 4, "passed": 2, "failed": 2}
+        )
+        self.assertEqual([f["index"] for f in report["failures"]], [1, 3])
+        first, second = report["failures"]
+        self.assertEqual(set(first), {"index", "expected", "actual"})
+        self.assertEqual(
+            first["expected"], {"effect": "allow", "rule": "read"}
+        )
+        self.assertEqual(
+            first["actual"],
+            gate.decide("alice", "read", "prod/db"),
+        )
+        self.assertEqual(first["actual"]["effect"], "deny")
+        self.assertEqual(first["actual"]["rule"], "prod-lock")
+        self.assertIn("reason", first["actual"])
+        # index 3: effect allow is right, but the winning rule differs
+        self.assertEqual(second["actual"]["effect"], "allow")
+        self.assertEqual(second["actual"]["rule"], "read")
+
+    def test_effect_and_rule_must_both_match_reason_ignored(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow"},
+                {"id": "d", "effect": "deny", "subject": "z"},
+            ]
+        )
+        # effect mismatch
+        report = gate.verify(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "deny", "rule": None}}]
+        )
+        self.assertEqual(report["summary"]["failed"], 1)
+        self.assertEqual(report["failures"][0]["actual"]["effect"], "allow")
+        # same effect but different rule still fails
+        report = gate.verify(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": "other"}}]
+        )
+        self.assertEqual(report["summary"]["failed"], 1)
+        self.assertEqual(report["failures"][0]["actual"]["rule"], "a")
+        # the full decision, including reason, is reported as actual
+        self.assertEqual(
+            set(report["failures"][0]["actual"]),
+            {"effect", "rule", "reason"},
+        )
+        # matching effect+rule passes regardless of the reason text
+        report = gate.verify(
+            [{"subject": "s", "action": "a", "resource": "r",
+              "expected": {"effect": "allow", "rule": "a"}}]
+        )
+        self.assertTrue(report["ok"])
+
+    def test_tags_omitted_none_and_mapping(self):
+        gate = PolicyGate(
+            [{"id": "tagged", "effect": "allow", "tags": {"env": "prod"}}]
+        )
+        cases = [
+            {"subject": "s", "action": "a", "resource": "r", "tags": None,
+             "expected": {"effect": "deny", "rule": None}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "expected": {"effect": "deny", "rule": None}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod"},
+             "expected": {"effect": "allow", "rule": "tagged"}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod", "extra": 1},
+             "expected": {"effect": "allow", "rule": "tagged"}},
+        ]
+        self.assertTrue(gate.verify(cases)["ok"])
+
+    def test_validation_error_codes(self):
+        gate = self._gate()
+        good_expectation = {"effect": "allow", "rule": "read"}
+        cases = [
+            ("nope", "invalid_cases", None, None),
+            (None, "invalid_cases", None, None),
+            ({}, "invalid_cases", None, None),
+            (42, "invalid_cases", None, None),
+            (["x"], "item_not_mapping", 0, None),
+            ([None], "item_not_mapping", 0, None),
+            ([{"action": "a", "resource": "r",
+               "expected": good_expectation}],
+             "missing_field", 0, "subject"),
+            ([{"subject": "s", "resource": "r",
+               "expected": good_expectation}],
+             "missing_field", 0, "action"),
+            ([{"subject": "s", "action": "a",
+               "expected": good_expectation}],
+             "missing_field", 0, "resource"),
+            ([{"subject": 1, "action": "a", "resource": "r",
+               "expected": good_expectation}],
+             "invalid_field_type", 0, "subject"),
+            ([{"subject": "s", "action": ["a"], "resource": "r",
+               "expected": good_expectation}],
+             "invalid_field_type", 0, "action"),
+            ([{"subject": "s", "action": "a", "resource": 9,
+               "expected": good_expectation}],
+             "invalid_field_type", 0, "resource"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "bogus": 1, "expected": good_expectation}],
+             "unknown_field", 0, "bogus"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "tags": "k=v", "expected": good_expectation}],
+             "invalid_field_type", 0, "tags"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "tags": [1], "expected": good_expectation}],
+             "invalid_field_type", 0, "tags"),
+            ([{"subject": "s", "action": "a", "resource": "r"}],
+             "missing_field", 0, "expected"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": "x"}],
+             "invalid_field_type", 0, "expected"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": None}],
+             "invalid_field_type", 0, "expected"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": "allow", "rule": "read", "z": 1}}],
+             "unknown_field", 0, "expected.z"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {}}],
+             "missing_field", 0, "expected.effect"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"rule": "read"}}],
+             "missing_field", 0, "expected.effect"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": "allow"}}],
+             "missing_field", 0, "expected.rule"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": "maybe", "rule": None}}],
+             "invalid_expectation", 0, "expected.effect"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": None, "rule": None}}],
+             "invalid_expectation", 0, "expected.effect"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": True, "rule": None}}],
+             "invalid_expectation", 0, "expected.effect"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": "deny", "rule": 3}}],
+             "invalid_expectation", 0, "expected.rule"),
+            ([{"subject": "s", "action": "a", "resource": "r",
+               "expected": {"effect": "deny", "rule": True}}],
+             "invalid_expectation", 0, "expected.rule"),
+        ]
+        for bad_cases, code, index, field in cases:
+            with self.subTest(bad=bad_cases):
+                with self.assertRaises(PolicyVerificationError) as ctx:
+                    gate.verify(bad_cases)
+                self.assertEqual(ctx.exception.code, code)
+                self.assertEqual(ctx.exception.index, index)
+                self.assertEqual(ctx.exception.field, field)
+                self.assertIn(code, str(ctx.exception))
+
+    def test_whole_batch_validated_before_any_decision(self):
+        gate = self._gate()
+        good = {
+            "subject": "alice", "action": "read", "resource": "dev/x",
+            "expected": {"effect": "allow", "rule": "read"},
+        }
+        with self.assertRaises(PolicyVerificationError) as ctx:
+            gate.verify([good, "not-a-mapping"])
+        self.assertEqual(ctx.exception.code, "item_not_mapping")
+        self.assertEqual(ctx.exception.index, 1)
+        with self.assertRaises(PolicyVerificationError) as ctx:
+            gate.verify(
+                [
+                    good,
+                    {"subject": "s", "action": "a", "resource": "r",
+                     "expected": {"effect": "nope", "rule": None}},
+                ]
+            )
+        self.assertEqual(ctx.exception.code, "invalid_expectation")
+        self.assertEqual(ctx.exception.field, "expected.effect")
+
+    def test_verify_is_read_only_and_repeatable(self):
+        import copy
+
+        gate = self._gate()
+        cases = [
+            {"subject": "alice", "action": "read", "resource": "dev/x",
+             "tags": {"env": "prod"},
+             "expected": {"effect": "allow", "rule": "read"}},
+            {"subject": "alice", "action": "read", "resource": "prod/db",
+             "expected": {"effect": "allow", "rule": "read"}},
+            {"subject": "bob", "action": "write", "resource": "x",
+             "expected": {"effect": "deny", "rule": None}},
+            {"subject": "x", "action": "y", "resource": "z",
+             "expected": {"effect": "allow", "rule": "read"}},
+        ]
+        cases_snapshot = copy.deepcopy(cases)
+        rules_snapshot = [dict(r) for r in gate.rules]
+        first = gate.verify(cases)
+        self.assertEqual(
+            [f["index"] for f in first["failures"]], [1, 3]
+        )
+        for _ in range(20):
+            self.assertEqual(gate.verify(copy.deepcopy(cases)), first)
+        self.assertEqual(cases, cases_snapshot)
+        self.assertEqual([dict(r) for r in gate.rules], rules_snapshot)
+        # mutating a returned report never affects later calls
+        first["ok"] = True
+        first["summary"]["failed"] = 0
+        first["failures"][0]["actual"]["rule"] = "tampered"
+        first["failures"][0]["expected"]["rule"] = "tampered"
+        fresh = gate.verify(cases)
+        self.assertFalse(fresh["ok"])
+        self.assertEqual(fresh["summary"]["failed"], 2)
+        self.assertEqual(
+            [f["index"] for f in fresh["failures"]], [1, 3]
+        )
+        self.assertEqual(fresh["failures"][0]["actual"]["rule"], "prod-lock")
+        self.assertEqual(
+            fresh["failures"][0]["expected"],
+            {"effect": "allow", "rule": "read"},
+        )
+
+    def test_from_json_gate_verifies_like_constructor_gate(self):
+        gate = self._gate()
+        loaded = PolicyGate.from_json(gate.to_json())
+        cases = self._cases() + [
+            {"subject": "x", "action": "y", "resource": "z",
+             "expected": {"effect": "allow", "rule": "read"}},
+        ]
+        self.assertEqual(loaded.verify(cases), gate.verify(cases))
+
+    def test_verify_does_not_change_other_apis(self):
+        gate = self._gate()
+        cases = self._cases()
+        gate.verify(cases)
+        gate.verify(cases)
+        self.assertEqual(
+            gate.decide("alice", "read", "prod/db")["rule"], "prod-lock"
+        )
+        self.assertEqual(
+            gate.decide("alice", "read", "dev/x")["rule"], "read"
+        )
+        # existing batch validation is untouched
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.decide_many("nope")
+        self.assertEqual(ctx.exception.code, "invalid_batch")
 
 
 if __name__ == "__main__":

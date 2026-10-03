@@ -10,6 +10,8 @@ _ALLOWED_FIELDS = frozenset(
 )
 _STRING_FIELDS = ("subject", "action", "resource")
 _REQUEST_FIELDS = frozenset({"subject", "action", "resource", "tags"})
+_CASE_FIELDS = frozenset({"subject", "action", "resource", "tags", "expected"})
+_EXPECTED_FIELDS = ("effect", "rule")
 
 
 class PolicyConfigError(Exception):
@@ -60,9 +62,45 @@ class PolicyBatchError(Exception):
         return "batch validation failed"
 
 
+class PolicyVerificationError(Exception):
+    """A case batch handed to :meth:`PolicyGate.verify` failed validation.
+
+    The machine-readable ``code`` attribute is one of ``invalid_cases``,
+    ``item_not_mapping``, ``unknown_field``, ``missing_field``,
+    ``invalid_field_type`` or ``invalid_expectation``. ``index`` is the
+    offending element index, or ``None`` when the outer cases value itself
+    is not a list or tuple. ``field`` names the offending field for the
+    field-level codes (``expected.effect`` and ``expected.rule`` use the
+    dotted nested form) and is ``None`` otherwise.
+    """
+
+    def __init__(self, code, index, field=None, message=None):
+        self.code = code
+        self.index = index
+        self.field = field
+        if message is None:
+            message = self._default_message(code, index, field)
+        super().__init__("[%s] %s" % (code, message))
+
+    @staticmethod
+    def _default_message(code, index, field):
+        if code == "invalid_cases":
+            return "cases must be a list or tuple of case mappings"
+        if code == "item_not_mapping":
+            return "case at index %s must be a mapping" % index
+        if code == "unknown_field":
+            return "case at index %d contains unknown field %r" % (index, field)
+        if code == "missing_field":
+            return "case at index %d is missing required field %r" % (index, field)
+        if code == "invalid_field_type":
+            return "case at index %d field %r has an invalid type" % (index, field)
+        if code == "invalid_expectation":
+            return "case at index %d field %r has an invalid value" % (index, field)
+        return "case validation failed"
+
+
 class _DuplicateKeyError(ValueError):
     """Raised internally by the JSON object hook when a key repeats."""
-
 
 def _reject_duplicate_keys(pairs):
     obj = {}
@@ -838,6 +876,149 @@ class PolicyGate:
             "deny": sum(1 for d in decisions if d["effect"] == "deny"),
         }
         return {"decisions": decisions, "summary": summary}
+
+    @staticmethod
+    def _validate_case_item(item, index):
+        # Within one item the error-class order mirrors the request
+        # validation: unknown-field first, then missing-field, then
+        # field-type; ties resolve in the fixed
+        # subject/action/resource/tags/expected order. The expectation's
+        # own shape is checked last.
+        unknown = [k for k in item if k not in _CASE_FIELDS]
+        if unknown:
+            raise PolicyVerificationError(
+                "unknown_field", index, field=unknown[0]
+            )
+
+        for field in _STRING_FIELDS:
+            if field not in item:
+                raise PolicyVerificationError(
+                    "missing_field", index, field=field
+                )
+        if "expected" not in item:
+            raise PolicyVerificationError(
+                "missing_field", index, field="expected"
+            )
+
+        for field in _STRING_FIELDS:
+            if not isinstance(item[field], str):
+                raise PolicyVerificationError(
+                    "invalid_field_type", index, field=field
+                )
+
+        if "tags" in item:
+            tags = item["tags"]
+            if tags is not None and not isinstance(tags, Mapping):
+                raise PolicyVerificationError(
+                    "invalid_field_type", index, field="tags"
+                )
+
+        expected = item["expected"]
+        if not isinstance(expected, Mapping):
+            raise PolicyVerificationError(
+                "invalid_field_type", index, field="expected"
+            )
+        for key in expected:
+            if key not in _EXPECTED_FIELDS:
+                raise PolicyVerificationError(
+                    "unknown_field", index, field="expected.%s" % key
+                )
+        for field in _EXPECTED_FIELDS:
+            if field not in expected:
+                raise PolicyVerificationError(
+                    "missing_field", index, field="expected.%s" % field
+                )
+        effect = expected["effect"]
+        if effect not in ("allow", "deny"):
+            raise PolicyVerificationError(
+                "invalid_expectation", index, field="expected.effect"
+            )
+        rule = expected["rule"]
+        if rule is not None and not isinstance(rule, str):
+            raise PolicyVerificationError(
+                "invalid_expectation", index, field="expected.rule"
+            )
+
+    @staticmethod
+    def _validate_cases(cases):
+        # The whole batch is checked before any decision is computed, so a
+        # malformed batch never produces partial verification results.
+        if not isinstance(cases, (list, tuple)):
+            raise PolicyVerificationError("invalid_cases", None)
+
+        for index, item in enumerate(cases):
+            if not isinstance(item, Mapping):
+                raise PolicyVerificationError("item_not_mapping", index)
+            PolicyGate._validate_case_item(item, index)
+
+    def verify(self, cases):
+        """Check fixed cases against the rules' final decisions, offline.
+
+        ``cases`` must be a list or tuple of mappings, each limited to the
+        keys ``subject``, ``action``, ``resource``, ``tags`` and
+        ``expected``. The first three are required strings; ``tags`` may be
+        omitted, be ``None`` or be any mapping accepted by :meth:`decide`.
+        ``expected`` is a required mapping holding exactly ``effect`` and
+        ``rule``: ``effect`` must be the string ``allow`` or ``deny`` and
+        ``rule`` must be a string or ``None`` (a default-deny expectation
+        is written as ``{"effect": "deny", "rule": None}``).
+
+        The whole batch is validated before any decision is computed, so a
+        malformed batch raises :class:`PolicyVerificationError` with
+        ``code``/``index``/``field`` and never produces partial results;
+        nested fields are reported as ``expected.effect`` or
+        ``expected.rule``. After validation each case is replayed through
+        :meth:`decide` in input order, and a case passes only when the
+        decision's ``effect`` and ``rule`` both equal the expectation;
+        ``reason`` never participates in the comparison.
+
+        Returns ``{"ok": bool, "failures": [...], "summary": {"total",
+        "passed", "failed"}}``. Each failure is listed in input order as
+        ``{"index", "expected", "actual"}``, where ``actual`` is the full
+        :meth:`decide` result; ``ok`` is true exactly when ``failed`` is
+        zero. An empty batch returns no failures, an all-zero summary and
+        ``ok`` true.
+
+        Verification is read-only and offline: neither rules, cases nor
+        tag mappings are modified, no I/O happens, gates built directly
+        and via :meth:`from_json` verify identically, repeated calls
+        return equal results, and mutating a returned report never affects
+        later calls.
+        """
+        self._validate_cases(cases)
+
+        failures = []
+        for index, item in enumerate(cases):
+            actual = self.decide(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            expected = item["expected"]
+            if (
+                actual["effect"] != expected["effect"]
+                or actual["rule"] != expected["rule"]
+            ):
+                failures.append(
+                    {
+                        "index": index,
+                        "expected": {
+                            "effect": expected["effect"],
+                            "rule": expected["rule"],
+                        },
+                        "actual": copy.deepcopy(actual),
+                    }
+                )
+
+        total = len(cases)
+        failed = len(failures)
+        summary = {
+            "total": total,
+            "passed": total - failed,
+            "failed": failed,
+        }
+        return {"ok": failed == 0, "failures": failures, "summary": summary}
 
     def coverage(self, requests):
         """Measure how the loaded rules participate in deciding a batch.

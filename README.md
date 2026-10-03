@@ -56,3 +56,14 @@ Tests: python3 -m unittest discover -s tests -v
 - `trace_many` 的 `requests` 沿用 `decide_many` 的边界，整批先校验，首个错误抛原有 `PolicyBatchError`（带 `code`、`index`、`field`），不返回部分结果；成功返回 `{"traces": [...], "summary": {"total", "allow", "deny"}}`，`traces` 按输入顺序排列，计数与 `decide_many` 相同，空批次为全零。
 - 两个入口只读、纯离线：不修改规则或调用方映射，无网络和其他 I/O；直接构造和 `from_json` 加载的规则具有相同追踪语义，且不影响 `decide`、`decide_many`、`explain`、`audit`、`coverage`、`compare`、`from_json`、`to_json`、`fingerprint` 的既有行为。
 
+## 发布前固定用例核验
+
+`PolicyGate.verify(cases)` 在发布前用一组固定用例核对规则的最终决策，纯离线、只读，不改变规则或输入。
+
+- `cases` 只接受 list 或 tuple；每项是映射，只允许 `subject`、`action`、`resource`、`tags`、`expected` 五个键。前三项为必填字符串，`tags` 可省略、为 `None` 或 mapping，匹配完全沿用 `decide` 的通配、标签精确约束、显式 deny、priority、声明顺序和默认 deny。
+- `expected` 必填，是只含 `effect`、`rule` 的映射：`effect` 必须为 `allow` 或 `deny`，`rule` 为字符串或 `null`；默认拒绝写成 `{"effect": "deny", "rule": null}`。
+- 整批先校验再判定，第一处错误抛 `PolicyVerificationError`（带 `code`、`index`、`field`）且不返回部分结果；批次容器错误、元素非映射、未知字段、缺失字段、字段类型错误、`expected` 值非法依次使用 `invalid_cases`、`item_not_mapping`、`unknown_field`、`missing_field`、`invalid_field_type`、`invalid_expectation`，嵌套字段写成 `expected.effect` 或 `expected.rule`。
+- 校验通过后按输入顺序调用既有 `decide`；仅当决策的 `effect` 与 `rule` 同时等于期望值才通过，`reason` 不参与比较。
+- 返回 `{"ok", "failures", "summary"}`：`summary` 固定含 `total`、`passed`、`failed`；`failures` 按输入顺序给出每项的 `index`、`expected`、`actual`，`actual` 是完整决策（含 `reason`）。`failed` 为零时 `ok` 为 `true`；空批次返回空 `failures`、全零汇总和 `true`。
+- 返回内容为独立副本，修改返回值不影响后续调用；重复调用及直接构造、`from_json` 加载的同一规则结果相同，不进行任何 I/O，且不改变其他公开 API 的既有校验、字段、优先级与异常行为。
+
