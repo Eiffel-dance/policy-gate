@@ -721,6 +721,104 @@ class PolicyGate:
         }
         return {"decisions": decisions, "summary": summary}
 
+    def trace(self, subject, action, resource, tags=None):
+        """Read-only per-rule evaluation trace for one request.
+
+        Shares decide()'s validation and selection semantics exactly: the
+        same subject/action/resource type checks (``TypeError`` on invalid
+        inputs, ``tags`` of ``None`` treated as an empty mapping), the same
+        ``fnmatch.fnmatchcase`` glob matching and exact tag constraints, and
+        the same explicit-deny, priority, declaration-order and
+        default-deny rules.
+
+        Returns the decision mapping (``effect``, ``rule`` and ``reason``,
+        identical to what :meth:`decide` returns) plus an ``evaluations``
+        array listing **every** loaded rule in declaration order. Each
+        entry has the fixed keys ``id``, ``effect``, ``priority``,
+        ``subject_match``, ``action_match``, ``resource_match``,
+        ``tags_match``, ``matched`` and ``selected``: the four ``*_match``
+        flags are the rule's individual selector results, ``matched`` is
+        their conjunction (exactly the rules :meth:`explain` lists), and
+        ``selected`` is true for the single rule that wins the decision
+        and false for every other rule. With a default deny the winning
+        rule is ``None`` and every ``selected`` flag is false.
+
+        The trace is read-only and offline: rules, the request and caller
+        tag mappings are never modified, no I/O happens, and repeated
+        calls return equal results.
+        """
+        tags = self._check_inputs(subject, action, resource, tags)
+        result, _matched = self._evaluate(subject, action, resource, tags)
+        winner_id = result["rule"]
+
+        evaluations = []
+        for rule in self.rules:
+            subject_match = fnmatch.fnmatchcase(subject, rule["subject"])
+            action_match = fnmatch.fnmatchcase(action, rule["action"])
+            resource_match = fnmatch.fnmatchcase(resource, rule["resource"])
+            tags_match = all(
+                tags.get(key) == value for key, value in rule["tags"].items()
+            )
+            matched = (
+                subject_match
+                and action_match
+                and resource_match
+                and tags_match
+            )
+            evaluations.append(
+                {
+                    "id": rule["id"],
+                    "effect": rule["effect"],
+                    "priority": rule["priority"],
+                    "subject_match": subject_match,
+                    "action_match": action_match,
+                    "resource_match": resource_match,
+                    "tags_match": tags_match,
+                    "matched": matched,
+                    "selected": winner_id is not None
+                    and rule["id"] == winner_id,
+                }
+            )
+
+        trace = dict(result)
+        trace["evaluations"] = evaluations
+        return trace
+
+    def trace_many(self, requests):
+        """Trace many requests in one offline, reviewable batch.
+
+        ``requests`` uses exactly the same list/tuple of request mappings
+        as :meth:`decide_many` and is validated exactly the same way: the
+        whole batch is checked before any trace is computed, so a malformed
+        batch raises :class:`PolicyBatchError` with the first error's
+        ``code``/``index``/``field`` and never produces partial traces.
+
+        Returns ``{"traces": [...], "summary": {"total", "allow",
+        "deny"}}`` with traces in input order, each identical to what a
+        plain :meth:`trace` call would return; the summary counts match
+        :meth:`decide_many` for the same batch. An empty batch yields an
+        empty trace list and an all-zero summary.
+
+        Rules and caller data are never modified and no I/O happens.
+        """
+        self._validate_requests(requests)
+
+        traces = [
+            self.trace(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            for item in requests
+        ]
+        summary = {
+            "total": len(traces),
+            "allow": sum(1 for t in traces if t["effect"] == "allow"),
+            "deny": sum(1 for t in traces if t["effect"] == "deny"),
+        }
+        return {"traces": traces, "summary": summary}
+
     def coverage(self, requests):
         """Measure how the loaded rules participate in deciding a batch.
 
