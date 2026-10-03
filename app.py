@@ -1,3 +1,4 @@
+import copy
 import fnmatch
 import hashlib
 import json
@@ -341,6 +342,130 @@ def _tags_compatible(t1, t2):
     return all(k not in t2 or t2[k] == v for k, v in t1.items())
 
 
+# --- minimal witness construction (used by PolicyGate.audit) -----------
+#
+# For every reported finding a concrete request is built that matches
+# both rules of the pair. Each of subject/action/resource is the
+# shortest string matched by both patterns (fnmatch.fnmatchcase
+# semantics), ties broken by Unicode code-point order; the empty string
+# is a valid result. The tags are exactly the merge of the two rules'
+# constraints (the pair is only reported when they are compatible), with
+# keys in code-point order and no invented entries.
+
+
+def _min_common_codepoint(r1, r2):
+    """Smallest codepoint present in both sorted range tuples, or None."""
+    i = j = 0
+    while i < len(r1) and j < len(r2):
+        lo = max(r1[i][0], r2[j][0])
+        if lo <= min(r1[i][1], r2[j][1]):
+            return lo
+        if r1[i][1] < r2[j][1]:
+            i += 1
+        else:
+            j += 1
+    return None
+
+
+def _better_string(s1, s2):
+    """The (length, code-point order) smaller of two candidate strings."""
+    if s1 is None:
+        return s2
+    if s2 is None:
+        return s1
+    if len(s1) != len(s2):
+        return s1 if len(s1) < len(s2) else s2
+    return s1 if s1 <= s2 else s2
+
+
+def _min_common_string(t1, t2):
+    """Shortest string matched by both tokenized glob patterns.
+
+    Among the shortest common strings the smallest in Unicode code-point
+    order is returned, so the result is unique; ``None`` means the
+    patterns share no string (the same condition ``_patterns_overlap``
+    checks, computed over the same token grid).
+    """
+    n1, n2 = len(t1), len(t2)
+    width = n2 + 1
+    # table[i * width + j]: minimal common string of t1[i:] and t2[j:].
+    # Cells are filled with i and j descending; every transition reads
+    # only already-filled cells.
+    table = [None] * ((n1 + 1) * width)
+    for i in range(n1, -1, -1):
+        for j in range(n2, -1, -1):
+            if i == n1 and j == n2:
+                table[i * width + j] = ""
+                continue
+            a = t1[i] if i < n1 else None
+            b = t2[j] if j < n2 else None
+            a_star = a is not None and a[0] == "star"
+            b_star = b is not None and b[0] == "star"
+            if a is None:
+                # t1 exhausted: the rest of t2 must be all stars.
+                best = table[i * width + j + 1] if b_star else None
+            elif b is None:
+                best = table[(i + 1) * width + j] if a_star else None
+            elif a_star and b_star:
+                # Both stars absorbing a character is never shorter than
+                # letting one of them match empty, so only the two
+                # empty-match options compete.
+                best = _better_string(
+                    table[(i + 1) * width + j], table[i * width + j + 1]
+                )
+            elif a_star:
+                # The star matches empty, or absorbs the smallest
+                # character the other side's class accepts.
+                best = table[(i + 1) * width + j]
+                rest = table[i * width + j + 1]
+                positive = _positive_ranges(b)
+                if rest is not None and positive:
+                    best = _better_string(best, chr(positive[0][0]) + rest)
+            elif b_star:
+                best = table[i * width + j + 1]
+                rest = table[(i + 1) * width + j]
+                positive = _positive_ranges(a)
+                if rest is not None and positive:
+                    best = _better_string(best, chr(positive[0][0]) + rest)
+            else:
+                lo = _min_common_codepoint(
+                    _positive_ranges(a), _positive_ranges(b)
+                )
+                rest = table[(i + 1) * width + j + 1]
+                best = None if lo is None or rest is None else chr(lo) + rest
+            table[i * width + j] = best
+    return table[0]
+
+
+def _witness_tags(t1, t2):
+    """Merged tag constraints of two compatible rules.
+
+    Keys appear in Unicode code-point order; shared keys keep the value
+    both rules agree on (the pair is only reported when the constraints
+    are compatible) and no key beyond the two rules' own is added.
+    Values are deep-copied so a caller mutating the report can never
+    reach the loaded rules.
+    """
+    merged = {}
+    for key in sorted(set(t1) | set(t2)):
+        merged[key] = copy.deepcopy(t1[key] if key in t1 else t2[key])
+    return merged
+
+
+def _build_witness(r1, r2, c1, c2):
+    """Minimal request matching both rules of a reported pair.
+
+    The overlap check that gates every finding guarantees each field has
+    a common string, so the three pattern fields are never None here.
+    """
+    return {
+        "subject": _min_common_string(c1[0], c2[0]),
+        "action": _min_common_string(c1[1], c2[1]),
+        "resource": _min_common_string(c1[2], c2[2]),
+        "tags": _witness_tags(r1["tags"], r2["tags"]),
+    }
+
+
 def _audit_pair(r1, r2, c1, c2):
     """Build the finding for one rule pair, or None when there is none."""
     if not (
@@ -357,6 +482,7 @@ def _audit_pair(r1, r2, c1, c2):
         and r1["resource"] == r2["resource"]
         and r1["tags"] == r2["tags"]
     )
+    witness = _build_witness(r1, r2, c1, c2)
     if identical:
         # Identical selectors: one rule can never win, so it is shadowed.
         if r1["effect"] != r2["effect"]:
@@ -387,6 +513,7 @@ def _audit_pair(r1, r2, c1, c2):
             "winner": winner["id"],
             "shadowed": loser["id"],
             "reason": reason,
+            "witness": witness,
         }
 
     if r1["effect"] != r2["effect"]:
@@ -404,6 +531,7 @@ def _audit_pair(r1, r2, c1, c2):
                 "rule %r for every request matching both, regardless of "
                 "priority" % (deny["id"], allow["id"])
             ),
+            "witness": witness,
         }
 
     # Same-effect partial overlap is not a conflict.
@@ -1014,12 +1142,30 @@ class PolicyGate:
 
         Returns ``{"findings": [...], "summary": {"total", "error",
         "warning"}}``. Each finding has the fixed keys ``code``,
-        ``severity``, ``rule``, ``other_rule``, ``winner``, ``shadowed``
-        and ``reason``; ``rule``/``other_rule`` are the earlier/later
-        declared rule ids and ``shadowed`` is None when no rule is fully
-        shadowed. Findings are stably ordered by declaration position
-        with at most one finding per pair. With no overlapping selectors
-        the report is empty and every summary count is 0.
+        ``severity``, ``rule``, ``other_rule``, ``winner``, ``shadowed``,
+        ``reason`` and ``witness``; ``rule``/``other_rule`` are the
+        earlier/later declared rule ids and ``shadowed`` is None when no
+        rule is fully shadowed. Findings are stably ordered by
+        declaration position with at most one finding per pair. With no
+        overlapping selectors the report is empty and every summary
+        count is 0.
+
+        ``witness`` is a minimal request that actually triggers the
+        finding, with the fixed keys ``subject``, ``action``,
+        ``resource`` and ``tags``. Each of the first three is the
+        shortest string matched by both rules' corresponding glob
+        patterns under fnmatch.fnmatchcase semantics (ties broken by
+        Unicode code-point order; the empty string is allowed), chosen
+        independently per field. ``tags`` merges exactly the two rules'
+        tag constraints — keys in Unicode code-point order, shared keys
+        keeping the value both rules agree on, no invented entries — so
+        the witness matches both rules and reproduces the reported
+        overlap, explicit-deny override or full shadowing when passed to
+        decide(). The witness is derived only from the normalized rule
+        fields, so directly constructed and from_json-loaded identical
+        rules produce identical witnesses; the report contains no
+        references to internal state, and mutating it cannot affect
+        later calls.
         """
         compiled = [
             (

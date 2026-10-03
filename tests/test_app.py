@@ -608,6 +608,12 @@ class AuditTest(unittest.TestCase):
                 "winner": "d1",
                 "shadowed": None,
                 "reason": finding["reason"],
+                "witness": {
+                    "subject": "",
+                    "action": "",
+                    "resource": "data/secret",
+                    "tags": {},
+                },
             },
         )
         self.assertIn("deny", finding["reason"])
@@ -790,6 +796,264 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(finding["rule"], "read")
         self.assertEqual(finding["other_rule"], "1")
         self.assertEqual(finding["winner"], "1")
+
+
+class WitnessTest(unittest.TestCase):
+    def _finding(self, rules):
+        (finding,) = PolicyGate(rules).audit()["findings"]
+        return finding
+
+    def test_witness_has_exactly_four_fixed_keys(self):
+        finding = self._finding(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*"},
+                {"id": "d", "effect": "deny", "resource": "data/x*"},
+            ]
+        )
+        self.assertEqual(
+            list(finding["witness"]), ["subject", "action", "resource", "tags"]
+        )
+
+    def test_every_finding_carries_a_witness(self):
+        gate = PolicyGate(
+            [
+                {"id": "r0", "effect": "allow", "action": "read"},
+                {"id": "r1", "effect": "deny", "action": "r*"},
+                {"id": "r2", "effect": "allow", "action": "read"},
+                {"id": "r3", "effect": "deny", "resource": "x"},
+                {"id": "r4", "effect": "deny", "resource": "x"},
+            ]
+        )
+        report = gate.audit()
+        self.assertGreater(report["summary"]["total"], 0)
+        for finding in report["findings"]:
+            self.assertIn("witness", finding)
+            witness = finding["witness"]
+            self.assertEqual(
+                set(witness), {"subject", "action", "resource", "tags"}
+            )
+
+    def test_witness_triggers_effect_overlap_decision(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "resource": "data/*"},
+                {"id": "d1", "effect": "deny", "resource": "data/secret*"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        witness = finding["witness"]
+        explanation = gate.explain(
+            witness["subject"],
+            witness["action"],
+            witness["resource"],
+            witness["tags"],
+        )
+        matched_ids = [r["id"] for r in explanation["matched_rules"]]
+        self.assertIn("a1", matched_ids)
+        self.assertIn("d1", matched_ids)
+        self.assertEqual(explanation["effect"], "deny")
+        self.assertEqual(explanation["rule"], finding["winner"])
+
+    def test_witness_triggers_shadowing_winner(self):
+        for rules in (
+            [
+                {"id": "a1", "effect": "allow", "priority": 10,
+                 "action": "read"},
+                {"id": "d1", "effect": "deny", "priority": -1,
+                 "action": "read"},
+            ],
+            [
+                {"id": "low", "effect": "deny", "priority": 1},
+                {"id": "high", "effect": "deny", "priority": 9},
+            ],
+            [
+                {"id": "first", "effect": "allow", "action": "r?ad"},
+                {"id": "second", "effect": "allow", "action": "r?ad"},
+            ],
+        ):
+            gate = PolicyGate(rules)
+            (finding,) = gate.audit()["findings"]
+            self.assertEqual(finding["code"], "shadowed_rule")
+            witness = finding["witness"]
+            decision = gate.decide(
+                witness["subject"],
+                witness["action"],
+                witness["resource"],
+                witness["tags"],
+            )
+            self.assertEqual(decision["rule"], finding["winner"])
+
+    def test_minimal_strings_for_glob_pairs(self):
+        cases = [
+            (("a?c", "abc"), "abc"),
+            (("?", "[!x]"), "\x00"),
+            (("a*", "*b"), "ab"),
+            (("*", "*"), ""),
+            (("[abc]x", "[bcd]x"), "bx"),
+            (("[!a]", "?"), "\x00"),
+            (("[", "?"), "["),
+            (("[]]", "]"), "]"),
+            (("中*", "中?"), "中\x00"),
+            (("文", "?"), "文"),
+            (("data/*", "data/secret*"), "data/secret"),
+            (("a**b", "a?b"), "a\x00b"),
+        ]
+        for (first, second), expected in cases:
+            with self.subTest(first=first, second=second):
+                finding = self._finding(
+                    [
+                        {"id": "a", "effect": "allow", "resource": first},
+                        {"id": "d", "effect": "deny", "resource": second},
+                    ]
+                )
+                self.assertEqual(finding["witness"]["resource"], expected)
+                # the pair is symmetric: swapping the rules must pick
+                # the same minimal string
+                swapped = self._finding(
+                    [
+                        {"id": "a", "effect": "allow", "resource": second},
+                        {"id": "d", "effect": "deny", "resource": first},
+                    ]
+                )
+                self.assertEqual(swapped["witness"]["resource"], expected)
+
+    def test_fields_chosen_independently(self):
+        finding = self._finding(
+            [
+                {
+                    "id": "a",
+                    "effect": "allow",
+                    "subject": "s*",
+                    "action": "read",
+                    "resource": "data/*",
+                },
+                {
+                    "id": "d",
+                    "effect": "deny",
+                    "subject": "*s",
+                    "action": "r?ad",
+                    "resource": "*/x",
+                },
+            ]
+        )
+        self.assertEqual(
+            finding["witness"],
+            {
+                "subject": "s",
+                "action": "read",
+                "resource": "data/x",
+                "tags": {},
+            },
+        )
+
+    def test_tags_merged_sorted_and_shared_keys_kept(self):
+        finding = self._finding(
+            [
+                {
+                    "id": "a",
+                    "effect": "allow",
+                    "tags": {"env": "prod", "z": 1},
+                },
+                {
+                    "id": "d",
+                    "effect": "deny",
+                    "tags": {"team": "sec", "env": "prod"},
+                },
+            ]
+        )
+        tags = finding["witness"]["tags"]
+        self.assertEqual(tags, {"env": "prod", "team": "sec", "z": 1})
+        self.assertEqual(list(tags), ["env", "team", "z"])
+
+    def test_conflicting_tags_produce_no_witness(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"env": "prod"}},
+                {"id": "d", "effect": "deny", "tags": {"env": "dev"}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_same_effect_partial_overlap_produces_no_witness(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*"},
+                {"id": "b", "effect": "allow", "resource": "data/x*"},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_disjoint_patterns_produce_no_witness(self):
+        for first, second in (
+            ("data/[0-9]*", "data/[a-z]*"),
+            ("[z-a]", "*"),
+            ("prod/?", "prod/xy"),
+        ):
+            gate = PolicyGate(
+                [
+                    {"id": "a", "effect": "allow", "resource": first},
+                    {"id": "d", "effect": "deny", "resource": second},
+                ]
+            )
+            self.assertEqual(gate.audit()["findings"], [])
+
+    def test_from_json_produces_identical_witness(self):
+        rules = [
+            {"id": "read", "effect": "allow", "action": "r?ad",
+             "resource": "docs/*", "tags": {"env": "prod"}},
+            {"effect": "deny", "resource": "docs/secret*",
+             "tags": {"team": "sec"}},
+        ]
+        gate = PolicyGate(rules)
+        loaded = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(gate.audit(), loaded.audit())
+        self.assertEqual(
+            gate.audit()["findings"][0]["witness"],
+            loaded.audit()["findings"][0]["witness"],
+        )
+
+    def test_repeated_audit_returns_equal_independent_reports(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*",
+                 "tags": {"nested": {"k": [1, 2]}}},
+                {"id": "d", "effect": "deny", "resource": "data/x*",
+                 "tags": {"nested": {"k": [1, 2]}}},
+            ]
+        )
+        first = gate.audit()
+        for _ in range(5):
+            self.assertEqual(gate.audit(), first)
+        # mutating the returned report must not affect later calls
+        witness = first["findings"][0]["witness"]
+        witness["tags"]["nested"]["k"].append(3)
+        witness["subject"] = "tampered"
+        first["findings"][0]["winner"] = "tampered"
+        fresh = gate.audit()
+        self.assertEqual(
+            fresh["findings"][0]["witness"],
+            {
+                "subject": "",
+                "action": "",
+                "resource": "data/x",
+                "tags": {"nested": {"k": [1, 2]}},
+            },
+        )
+        self.assertEqual(fresh["findings"][0]["winner"], "d")
+        # the loaded rules were not touched either
+        self.assertEqual(gate.rules[0]["tags"], {"nested": {"k": [1, 2]}})
+
+    def test_audit_witness_does_not_change_decisions(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow", "priority": 5,
+                 "resource": "data/*"},
+                {"id": "d1", "effect": "deny", "resource": "data/secret*"},
+            ]
+        )
+        before = gate.decide("s", "read", "data/secret1")
+        gate.audit()
+        self.assertEqual(gate.decide("s", "read", "data/secret1"), before)
 
 
 class SnapshotTest(unittest.TestCase):
