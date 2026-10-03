@@ -16,7 +16,8 @@ Tests: python3 -m unittest discover -s tests -v
 - 按声明顺序检查每对规则；主体/动作/资源模式按 `fnmatch.fnmatchcase` 真实语义判断是否存在共同匹配字符串，标签约束仅在同键不同值时冲突。
 - 非等价选择器且 effect 不同的重叠产生一条 `effect_overlap`（error），`winner` 为重叠范围内获胜的 deny 规则（显式拒绝覆盖 allow，priority 不改变结果）。
 - 三个模式文本和标签完全相同的选择器产生一条 `shadowed_rule`：allow 被 deny 遮蔽为 error，相同 effect 为 warning（按优先级再按声明顺序确定被遮蔽方）。
-- 相同 effect 的部分重叠不算冲突。每条 finding 固定含 `code`、`severity`、`rule`、`other_rule`、`winner`、`shadowed`、`reason`；无法完全遮蔽时 `shadowed` 为 `None`。无重叠选择器时返回空报告。
+- 相同 effect 的部分重叠不算冲突。每条 finding 固定含 `code`、`severity`、`rule`、`other_rule`、`winner`、`shadowed`、`reason`、`witness`；无法完全遮蔽时 `shadowed` 为 `None`。无重叠选择器时返回空报告。
+- `witness` 是一个确实能触发该 finding 的最小见证请求，固定含 `subject`、`action`、`resource`、`tags` 四个键：把它交回 `decide`/`explain` 必然同时命中该对规则（`effect_overlap` 下 deny 必然最终生效）。三个字符串字段各自独立地取所有同时匹配两条规则 `fnmatch.fnmatchcase` 模式的字符串中最短者，长度相同取 Unicode 码点字典序最小者，允许空字符串；`tags` 只合并两条规则的标签约束（共享键值在产生 finding 时必相同，互不冲突的键全部保留，键按 Unicode 码点顺序输出，不凭空添加标签）。直接构造与 `from_json` 得到的相同规则生成完全相同的 witness，重复调用返回相等结果，修改返回的报告不影响后续调用。
 
 ## 可复核策略快照
 

@@ -1,3 +1,4 @@
+import copy
 import fnmatch
 import hashlib
 import json
@@ -300,6 +301,112 @@ def _classes_overlap(t1, t2):
     return _ranges_intersect(_positive_ranges(t1), _positive_ranges(t2))
 
 
+def _token_min_char(token):
+    """Smallest single character (by Unicode code point) a char token matches."""
+    return chr(_positive_ranges(token)[0][0])
+
+
+def _intersection_min_char(t1, t2):
+    """Smallest character matched by both char tokens, or None if disjoint."""
+    r1 = _positive_ranges(t1)
+    r2 = _positive_ranges(t2)
+    i = j = 0
+    found = None
+    while i < len(r1) and j < len(r2):
+        lo = max(r1[i][0], r2[j][0])
+        hi = min(r1[i][1], r2[j][1])
+        if lo <= hi and (found is None or lo < found):
+            found = lo
+        if r1[i][1] < r2[j][1]:
+            i += 1
+        else:
+            j += 1
+    return chr(found) if found is not None else None
+
+
+def _min_common_string(t1, t2):
+    """Shortest string matching both tokenized patterns; ties broken by
+    Unicode code-point lexicographic order.
+
+    Mirrors :func:`_patterns_overlap` over the same token grid, but each
+    reachable state stores the minimum witness suffix as a ``(length,
+    text)`` pair (compared by length first, then text) instead of a mere
+    boolean: a `*` may match the empty string, skip itself, or absorb one
+    character demanded by a char token on the other side. A star/star
+    alignment never needs to emit a character. Returns None only when the
+    two patterns have no common string, which cannot happen for a pair
+    whose overlap has already been established.
+    """
+    n1, n2 = len(t1), len(t2)
+    best = [[None] * (n2 + 1) for _ in range(n1 + 1)]
+    best[n1][n2] = (0, "")
+    for j in range(n2 - 1, -1, -1):
+        if t2[j][0] == "star":
+            best[n1][j] = best[n1][j + 1]
+    for i in range(n1 - 1, -1, -1):
+        if t1[i][0] == "star":
+            best[i][n2] = best[i + 1][n2]
+
+    for i in range(n1 - 1, -1, -1):
+        a = t1[i]
+        a_star = a[0] == "star"
+        for j in range(n2 - 1, -1, -1):
+            b = t2[j]
+            candidates = []
+            if a_star:
+                candidates.append(best[i + 1][j])  # a's '*' matches empty
+                if b[0] == "star":
+                    candidates.append(best[i][j + 1])
+                elif _class_satisfiable(b):
+                    tail = best[i][j + 1]  # a's '*' absorbs b's char
+                    if tail is not None:
+                        candidates.append(
+                            (tail[0] + 1, _token_min_char(b) + tail[1])
+                        )
+            elif b[0] == "star":
+                candidates.append(best[i][j + 1])  # b's '*' matches empty
+                if _class_satisfiable(a):
+                    tail = best[i + 1][j]  # b's '*' absorbs a's char
+                    if tail is not None:
+                        candidates.append(
+                            (tail[0] + 1, _token_min_char(a) + tail[1])
+                        )
+            else:
+                ch = _intersection_min_char(a, b)
+                tail = best[i + 1][j + 1]
+                if ch is not None and tail is not None:
+                    candidates.append((tail[0] + 1, ch + tail[1]))
+            candidates = [c for c in candidates if c is not None]
+            best[i][j] = min(candidates) if candidates else None
+
+    result = best[0][0]
+    return None if result is None else result[1]
+
+
+def _merge_witness_tags(tags1, tags2):
+    """Joint tag assignment satisfying both rules' exact constraints.
+
+    Findings only arise when shared keys carry equal values, so the union
+    is conflict-free; keys are emitted in Unicode code-point order and no
+    other tag is invented. Values are deep-copied (direct construction
+    permits mutable tag values) so a caller mutating a returned report can
+    never touch the loaded rules or later reports.
+    """
+    merged = dict(tags1)
+    merged.update(tags2)
+    return {key: copy.deepcopy(merged[key]) for key in sorted(merged)}
+
+
+def _pair_witness(r1, r2, c1, c2):
+    """Minimum request matching both selectors of one audited pair."""
+    return {
+        "subject": _min_common_string(c1[0], c2[0]),
+        "action": _min_common_string(c1[1], c2[1]),
+        "resource": _min_common_string(c1[2], c2[2]),
+        "tags": _merge_witness_tags(r1["tags"], r2["tags"]),
+    }
+
+
 def _patterns_overlap(t1, t2):
     """True iff some string matches both tokenized glob patterns.
 
@@ -387,6 +494,7 @@ def _audit_pair(r1, r2, c1, c2):
             "winner": winner["id"],
             "shadowed": loser["id"],
             "reason": reason,
+            "witness": _pair_witness(r1, r2, c1, c2),
         }
 
     if r1["effect"] != r2["effect"]:
@@ -404,6 +512,7 @@ def _audit_pair(r1, r2, c1, c2):
                 "rule %r for every request matching both, regardless of "
                 "priority" % (deny["id"], allow["id"])
             ),
+            "witness": _pair_witness(r1, r2, c1, c2),
         }
 
     # Same-effect partial overlap is not a conflict.
@@ -1014,12 +1123,29 @@ class PolicyGate:
 
         Returns ``{"findings": [...], "summary": {"total", "error",
         "warning"}}``. Each finding has the fixed keys ``code``,
-        ``severity``, ``rule``, ``other_rule``, ``winner``, ``shadowed``
-        and ``reason``; ``rule``/``other_rule`` are the earlier/later
-        declared rule ids and ``shadowed`` is None when no rule is fully
-        shadowed. Findings are stably ordered by declaration position
-        with at most one finding per pair. With no overlapping selectors
-        the report is empty and every summary count is 0.
+        ``severity``, ``rule``, ``other_rule``, ``winner``, ``shadowed``,
+        ``reason`` and ``witness``; ``rule``/``other_rule`` are the
+        earlier/later declared rule ids and ``shadowed`` is None when no
+        rule is fully shadowed. Findings are stably ordered by declaration
+        position with at most one finding per pair. With no overlapping
+        selectors the report is empty and every summary count is 0.
+
+        ``witness`` is a concrete request that actually triggers the
+        finding, with exactly the keys ``subject``, ``action``,
+        ``resource`` and ``tags``: replaying it through decide() matches
+        both rules of the pair under fnmatch.fnmatchcase semantics and the
+        pair's exact tag constraints, so it reproduces the reported
+        effect overlap or full shadowing. For each string field the
+        witness is the shortest string matching both rules' patterns,
+        ties broken by Unicode code-point lexicographic order (the empty
+        string is allowed), and the three fields are chosen
+        independently. ``tags`` merges both rules' constraints only:
+        shared keys already carry equal values for a reported pair, all
+        non-conflicting keys are retained, keys are emitted in Unicode
+        code-point order, and no other request tag is invented. Rules
+        built directly and via from_json produce identical witnesses,
+        repeated calls return equal results, and mutating a returned
+        report never affects later calls.
         """
         compiled = [
             (
