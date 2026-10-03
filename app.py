@@ -721,6 +721,79 @@ class PolicyGate:
         }
         return {"decisions": decisions, "summary": summary}
 
+    def coverage(self, requests):
+        """Offline per-rule coverage report for one validated request batch.
+
+        ``requests`` uses exactly the same batch boundary as
+        :meth:`decide_many`: a list or tuple of mappings with required
+        string fields ``subject``, ``action``, ``resource`` and an optional
+        ``tags`` mapping. The whole batch is validated before any rule is
+        examined, so a malformed batch raises :class:`PolicyBatchError`
+        (with ``code``/``index``/``field``) and never yields a partial
+        report.
+
+        Returns ``{"rules": [...], "summary": {"total", "allow",
+        "explicit_deny", "default_deny", "matched_request"}}``. ``rules``
+        lists every loaded rule in declaration order as ``{"id", "effect",
+        "matched", "winner"}``: ``matched`` counts requests whose selector
+        matches the rule, ``winner`` counts requests the rule finally wins.
+        A request matching several rules increments ``matched`` on all of
+        them but ``winner`` only on the single final rule, chosen by the
+        same explicit-deny, priority and declaration-order rules as
+        :meth:`decide`; a default-deny request increments no rule's
+        ``winner``.
+
+        In the summary, ``total`` is the request count; ``allow`` and
+        ``explicit_deny`` count requests finally won by an allow or deny
+        rule; ``default_deny`` counts requests that matched no rule; and
+        ``matched_request`` counts requests matching at least one rule.
+        An empty batch reports all-zero counts while still listing every
+        rule; with no rules loaded, every request counts as
+        ``default_deny``. Matching uses the same fnmatch.fnmatchcase
+        globbing and exact tag constraints as :meth:`decide`.
+
+        The report is read-only and offline: rules, request mappings and
+        tag mappings are never modified, no I/O happens, and repeated calls
+        return equal results. Decisions themselves are unchanged.
+        """
+        self._validate_requests(requests)
+
+        report_rules = [
+            {"id": rule["id"], "effect": rule["effect"], "matched": 0, "winner": 0}
+            for rule in self.rules
+        ]
+        index_by_id = {rule["id"]: i for i, rule in enumerate(self.rules)}
+
+        allow = explicit_deny = default_deny = matched_request = 0
+        for item in requests:
+            result, matched = self._evaluate(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            if matched:
+                matched_request += 1
+            for rule in matched:
+                report_rules[rule["_index"]]["matched"] += 1
+            if result["rule"] is None:
+                default_deny += 1
+                continue
+            report_rules[index_by_id[result["rule"]]]["winner"] += 1
+            if result["effect"] == "allow":
+                allow += 1
+            else:
+                explicit_deny += 1
+
+        summary = {
+            "total": len(requests),
+            "allow": allow,
+            "explicit_deny": explicit_deny,
+            "default_deny": default_deny,
+            "matched_request": matched_request,
+        }
+        return {"rules": report_rules, "summary": summary}
+
     def compare(self, candidate, requests):
         """Compare this gate (the baseline) against ``candidate`` on one batch.
 

@@ -28,6 +28,16 @@ Tests: python3 -m unittest discover -s tests -v
 - 直接构造的规则若含不能无损表示为严格 JSON 的值（元组、集合、非有限数字、含非字符串键的嵌套映射，或无法 UTF-8 编码的孤立代理项），`to_json` 与 `fingerprint` 均抛出消息含固定标识 `non_json_value` 的 `ValueError`，且不返回任何部分文本。
 - 快照功能纯离线：无文件、网络或其他外部 I/O。
 
+## 请求覆盖报告
+
+`PolicyGate.coverage(requests)` 让调用方用一批请求检查每条规则是否参与判定、最终赢了多少次，不改任何判定结果。
+
+- `requests` 沿用 `decide_many` 的 list/tuple 与请求映射；`subject`、`action`、`resource` 为必填字符串，`tags` 可省略、为 `None` 或 mapping。整批先完整校验容器、元素、未知键、缺失键和类型，沿用 `PolicyBatchError` 的 `code`、`index`、`field`；第一处错误立即终止，不返回部分报告。
+- 返回 `{"rules": [...], "summary": {"total", "allow", "explicit_deny", "default_deny", "matched_request"}}`。`rules` 按声明顺序为每条规则给出 `id`、`effect`、`matched`、`winner`：`matched` 是选择器与该请求匹配的次数，`winner` 是经显式拒绝、priority 和声明顺序决胜后最终由该规则赢得的次数。
+- 同一请求命中多条规则时，所有命中规则的 `matched` 各加一，只有最终规则的 `winner` 加一；默认拒绝不给任何规则增加 `winner`。
+- `summary` 中 `total` 为请求数，`allow` 为最终效果 allow 的请求数，`explicit_deny` 为 deny 规则赢得的请求数，`default_deny` 为未命中任何规则而落入默认拒绝的请求数，`matched_request` 为至少命中一条规则的请求数。空批次全部计数为零（仍列出全部规则）；空规则集按请求数统计 `default_deny`。
+- 匹配口径与 `decide` 完全一致（`fnmatch.fnmatchcase` 与标签精确约束、显式 deny 优先、同效果按 priority 再按声明顺序决胜、默认 deny）。报告只读且纯离线：不修改规则或调用方映射，无 I/O，重复调用结果相同。
+
 ## 策略版本回归比较
 
 `PolicyGate.compare(candidate, requests)` 把调用对象作为基线、`candidate`（必须为 `PolicyGate`，否则抛 `TypeError`）作为候选，对同一批请求分别按各自既有的通配、显式 deny、priority、声明顺序和默认 deny 规则判定，定位候选改动。
