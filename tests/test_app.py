@@ -3228,5 +3228,438 @@ class TagExcludePatternsTest(unittest.TestCase):
         )
 
 
+class TagPresenceTest(unittest.TestCase):
+    def test_required_key_matches_any_value(self):
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_presence": {"env": True}}]
+        )
+        for tags in ({"env": "prod"}, {"env": 5}, {"env": None},
+                     {"env": ["x"]}, {"env": {"a": 1}}, {"env": ""}):
+            self.assertEqual(
+                gate.decide("s", "a", "r", tags)["rule"], "p", tags
+            )
+        for tags in ({}, {"team": "core"}, None):
+            self.assertIsNone(gate.decide("s", "a", "r", tags)["rule"])
+
+    def test_forbidden_key_must_be_absent(self):
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_presence": {"tmp": False}}]
+        )
+        self.assertEqual(gate.decide("s", "a", "r")["rule"], "p")
+        self.assertEqual(gate.decide("s", "a", "r", {})["rule"], "p")
+        self.assertEqual(
+            gate.decide("s", "a", "r", {"env": "prod"})["rule"], "p"
+        )
+        for tags in ({"tmp": "x"}, {"tmp": None}, {"tmp": False}):
+            self.assertIsNone(gate.decide("s", "a", "r", tags)["rule"])
+
+    def test_conjunction_with_other_tag_constraints(self):
+        gate = PolicyGate(
+            [
+                {"id": "p", "effect": "allow",
+                 "tags": {"team": "core"},
+                 "tag_patterns": {"env": "prod-*"},
+                 "tag_exclude_patterns": {"stage": "tmp-*"},
+                 "tag_presence": {"owner": True, "debug": False}},
+            ]
+        )
+
+        def matched(tags):
+            return gate.decide("s", "a", "r", tags)["rule"] == "p"
+
+        self.assertTrue(matched({"team": "core", "env": "prod-eu",
+                                 "stage": "stable", "owner": "ops"}))
+        self.assertFalse(matched({"team": "core", "env": "prod-eu",
+                                  "stage": "stable"}))
+        self.assertFalse(matched({"team": "core", "env": "prod-eu",
+                                  "stage": "stable", "owner": "ops",
+                                  "debug": 1}))
+        self.assertFalse(matched({"team": "core", "env": "dev",
+                                  "stage": "stable", "owner": "ops"}))
+        self.assertFalse(matched({"team": "core", "env": "prod-eu",
+                                  "stage": "tmp-1", "owner": "ops"}))
+
+    def test_deny_priority_and_order_semantics_kept(self):
+        gate = PolicyGate(
+            [
+                {"id": "allow", "effect": "allow", "priority": 9,
+                 "tag_presence": {"env": True}},
+                {"id": "deny", "effect": "deny", "priority": 1,
+                 "tag_presence": {"env": True}},
+            ]
+        )
+        decision = gate.decide("s", "a", "r", {"env": "x"})
+        self.assertEqual((decision["effect"], decision["rule"]),
+                         ("deny", "deny"))
+        gate = PolicyGate(
+            [
+                {"id": "low", "effect": "allow", "priority": 1,
+                 "tag_presence": {"env": True}},
+                {"id": "high", "effect": "allow", "priority": 2,
+                 "tag_presence": {"env": True}},
+            ]
+        )
+        self.assertEqual(
+            gate.decide("s", "a", "r", {"env": "x"})["rule"], "high"
+        )
+
+    def test_empty_and_missing_presence_behave_like_legacy(self):
+        legacy = PolicyGate([{"id": "p", "effect": "allow"}])
+        empty = PolicyGate(
+            [{"id": "p", "effect": "allow", "tag_presence": {}}]
+        )
+        for tags in (None, {}, {"env": "prod"}):
+            self.assertEqual(
+                legacy.decide("s", "a", "r", tags),
+                empty.decide("s", "a", "r", tags),
+            )
+        self.assertEqual(legacy.to_json(), empty.to_json())
+        self.assertEqual(legacy.fingerprint(), empty.fingerprint())
+
+    def test_invalid_tag_presence_shape(self):
+        for bad in (
+            "x",
+            ["env"],
+            ("env",),
+            None,
+            True,
+            1,
+            {"env": 1},
+            {"env": 0},
+            {"env": None},
+            {"env": "true"},
+            {"env": ["yes"]},
+            {1: True},
+            {"env": True, 2: False},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                PolicyGate([{"effect": "allow", "tag_presence": bad}])
+            self.assertTrue(
+                str(ctx.exception).startswith("invalid_tag_presence"),
+                "%r -> %s" % (bad, ctx.exception),
+            )
+
+    def test_invalid_tag_presence_names_rule_index(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate(
+                [{"effect": "allow"}, {"effect": "deny",
+                                       "tag_presence": "x"}]
+            )
+        self.assertIn("rule 1", str(ctx.exception))
+
+    def test_tag_presence_conflict(self):
+        for rule in (
+            {"tags": {"env": "prod"}, "tag_presence": {"env": True}},
+            {"tag_patterns": {"env": "prod-*"},
+             "tag_presence": {"env": False}},
+            {"tag_exclude_patterns": {"env": "tmp-*"},
+             "tag_presence": {"env": True}},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                PolicyGate([dict(effect="allow", **rule)])
+            self.assertTrue(
+                str(ctx.exception).startswith("tag_presence_conflict"),
+                "%r -> %s" % (rule, ctx.exception),
+            )
+            self.assertIn("'env'", str(ctx.exception))
+        # disjoint keys are fine
+        gate = PolicyGate(
+            [
+                {"effect": "allow", "tags": {"team": "core"},
+                 "tag_presence": {"env": True}},
+            ]
+        )
+        self.assertEqual(
+            gate.decide("s", "a", "r", {"team": "core", "env": 1})["rule"],
+            "0",
+        )
+
+    def test_from_json_raises_same_value_errors(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow", "tag_presence": {"env": 1}}]'
+            )
+        self.assertTrue(str(ctx.exception).startswith("invalid_tag_presence"))
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow", "tags": {"env": "a"},'
+                ' "tag_presence": {"env": true}}]'
+            )
+        self.assertTrue(str(ctx.exception).startswith("tag_presence_conflict"))
+
+    def test_trace_tags_match_includes_presence(self):
+        gate = PolicyGate(
+            [
+                {"id": "p", "effect": "allow", "tags": {"team": "core"},
+                 "tag_presence": {"env": True, "debug": False}},
+            ]
+        )
+
+        def tags_match(tags):
+            return gate.trace("s", "a", "r", tags)["evaluations"][0][
+                "tags_match"
+            ]
+
+        self.assertTrue(tags_match({"team": "core", "env": "prod"}))
+        self.assertTrue(tags_match({"team": "core", "env": 5}))
+        self.assertFalse(tags_match({"team": "core"}))
+        self.assertFalse(tags_match({"team": "core", "env": "prod",
+                                     "debug": None}))
+        self.assertFalse(tags_match({"env": "prod"}))
+        self.assertFalse(tags_match(None))
+
+    def test_batch_entry_points_use_presence_constraints(self):
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_presence": {"env": True, "tmp": False}}]
+        )
+        batch = [
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod"}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"tmp": 1}},
+            {"subject": "s", "action": "a", "resource": "r"},
+        ]
+        result = gate.decide_many(batch)
+        self.assertEqual(
+            [d["rule"] for d in result["decisions"]], ["p", None, None]
+        )
+        traces = gate.trace_many(batch)
+        self.assertEqual(
+            [t["rule"] for t in traces["traces"]], ["p", None, None]
+        )
+        coverage = gate.coverage(batch)
+        self.assertEqual(coverage["rules"][0]["matched"], 1)
+        self.assertEqual(coverage["rules"][0]["winner"], 1)
+        verification = gate.verify(
+            [
+                dict(batch[0], expected={"effect": "allow", "rule": "p"}),
+                dict(batch[1], expected={"effect": "deny", "rule": None}),
+                dict(batch[2], expected={"effect": "deny", "rule": None}),
+            ]
+        )
+        self.assertTrue(verification["ok"])
+
+    def test_compare_against_candidate_with_presence(self):
+        baseline = PolicyGate([{"id": "p", "effect": "allow"}])
+        candidate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_presence": {"env": True}}]
+        )
+        result = baseline.compare(
+            candidate,
+            [
+                {"subject": "s", "action": "a", "resource": "r",
+                 "tags": {"env": "prod"}},
+                {"subject": "s", "action": "a", "resource": "r"},
+            ],
+        )
+        self.assertEqual(result["summary"]["changed"], 1)
+        self.assertEqual(result["changes"][0]["kind"], "allow_to_deny")
+        self.assertEqual(result["changes"][0]["index"], 1)
+
+    def test_audit_presence_contradiction_removes_finding(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_presence": {"env": True}},
+                {"id": "d", "effect": "deny",
+                 "tag_presence": {"env": False}},
+            ]
+        )
+        self.assertEqual(
+            gate.audit()["summary"], {"total": 0, "error": 0, "warning": 0}
+        )
+
+    def test_audit_forbidden_key_against_exact_or_pattern(self):
+        for other in (
+            {"tags": {"env": "prod"}},
+            {"tag_patterns": {"env": "prod-*"}},
+        ):
+            gate = PolicyGate(
+                [
+                    {"id": "a", "effect": "allow",
+                     "tag_presence": {"env": False}},
+                    dict(id="d", effect="deny", **other),
+                ]
+            )
+            self.assertEqual(gate.audit()["findings"], [], other)
+
+    def test_audit_forbidden_key_passes_exclusion_by_absence(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_presence": {"tmp": False}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"tmp": "*"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertNotIn("tmp", finding["witness"]["tags"])
+        decision = gate.decide(
+            finding["witness"]["subject"], finding["witness"]["action"],
+            finding["witness"]["resource"], finding["witness"]["tags"],
+        )
+        self.assertEqual((decision["effect"], decision["rule"]),
+                         ("deny", "d"))
+
+    def test_audit_presence_only_key_witness_is_shortest_string(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_presence": {"env": True}},
+                {"id": "d", "effect": "deny", "tags": {"team": "core"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+        self.assertEqual(
+            finding["witness"]["tags"], {"env": "", "team": "core"}
+        )
+        self.assertEqual(list(finding["witness"]["tags"]), ["env", "team"])
+        decision = gate.decide(
+            finding["witness"]["subject"], finding["witness"]["action"],
+            finding["witness"]["resource"], finding["witness"]["tags"],
+        )
+        self.assertEqual((decision["effect"], decision["rule"]),
+                         ("deny", "d"))
+
+    def test_audit_shared_required_key_witness(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_presence": {"env": True}},
+                {"id": "d", "effect": "deny",
+                 "tag_patterns": {"env": "prod-*"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["tags"], {"env": "prod-"})
+        decision = gate.decide(
+            finding["witness"]["subject"], finding["witness"]["action"],
+            finding["witness"]["resource"], finding["witness"]["tags"],
+        )
+        self.assertEqual((decision["effect"], decision["rule"]),
+                         ("deny", "d"))
+
+    def test_audit_shadowed_identical_presence(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_presence": {"env": True}},
+                {"id": "b", "effect": "allow",
+                 "tag_presence": {"env": True}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "shadowed_rule")
+        self.assertEqual(finding["severity"], "warning")
+        self.assertEqual(finding["shadowed"], "b")
+        # different presence mappings are not identical selectors
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_presence": {"env": True}},
+                {"id": "b", "effect": "allow",
+                 "tag_presence": {"env": True, "tmp": False}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_to_json_exports_presence_after_exclude_patterns(self):
+        gate = PolicyGate(
+            [
+                {"id": "p", "effect": "allow",
+                 "tag_patterns": {"env": "prod-*"},
+                 "tag_exclude_patterns": {"stage": "tmp-*"},
+                 "tag_presence": {"owner": True, "debug": False}},
+            ]
+        )
+        self.assertEqual(
+            gate.to_json(),
+            '[{"id":"p","effect":"allow","priority":0,"subject":"*",'
+            '"action":"*","resource":"*","tags":{},'
+            '"tag_patterns":{"env":"prod-*"},'
+            '"tag_exclude_patterns":{"stage":"tmp-*"},'
+            '"tag_presence":{"debug":false,"owner":true}}]',
+        )
+        # without pattern fields the presence mapping still follows tags
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_presence": {"env": True}}]
+        )
+        self.assertEqual(
+            gate.to_json(),
+            '[{"id":"p","effect":"allow","priority":0,"subject":"*",'
+            '"action":"*","resource":"*","tags":{},'
+            '"tag_presence":{"env":true}}]',
+        )
+
+    def test_legacy_snapshot_bytes_and_fingerprint_unchanged(self):
+        legacy = PolicyGate([{"id": "x", "effect": "allow", "tags": {"a": "b"}}])
+        self.assertEqual(
+            legacy.to_json(),
+            '[{"id":"x","effect":"allow","priority":0,"subject":"*",'
+            '"action":"*","resource":"*","tags":{"a":"b"}}]',
+        )
+        import hashlib
+
+        self.assertEqual(
+            legacy.fingerprint(),
+            hashlib.sha256(legacy.to_json().encode("utf-8")).hexdigest(),
+        )
+        present = PolicyGate(
+            [{"id": "x", "effect": "allow", "tags": {"a": "b"},
+              "tag_presence": {"env": True}}]
+        )
+        self.assertNotEqual(legacy.fingerprint(), present.fingerprint())
+
+    def test_roundtrip_preserves_behavior(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "priority": 3, "subject": "u*",
+                 "tags": {"team": "core"},
+                 "tag_patterns": {"env": "prod-?"},
+                 "tag_exclude_patterns": {"stage": "tmp-*"},
+                 "tag_presence": {"owner": True, "debug": False}},
+                {"id": "d", "effect": "deny", "resource": "secret/*",
+                 "tag_presence": {"locked": False}},
+            ]
+        )
+        loaded = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(loaded.to_json(), gate.to_json())
+        self.assertEqual(loaded.fingerprint(), gate.fingerprint())
+        requests = [
+            {"subject": "u1", "action": "read", "resource": "doc",
+             "tags": {"team": "core", "env": "prod-1", "stage": "stable",
+                      "owner": "ops"}},
+            {"subject": "u1", "action": "read", "resource": "doc",
+             "tags": {"team": "core", "env": "prod-1", "stage": "stable"}},
+            {"subject": "u1", "action": "read", "resource": "doc",
+             "tags": {"team": "core", "env": "prod-1", "stage": "stable",
+                      "owner": "ops", "debug": True}},
+            {"subject": "u1", "action": "read", "resource": "secret/x",
+             "tags": {"team": "core", "env": "prod-1", "owner": "ops"}},
+            {"subject": "u1", "action": "read", "resource": "secret/x",
+             "tags": {"team": "core", "env": "prod-1", "owner": "ops",
+                      "locked": "y"}},
+        ]
+        self.assertEqual(loaded.decide_many(requests), gate.decide_many(requests))
+        self.assertEqual(loaded.coverage(requests), gate.coverage(requests))
+        self.assertEqual(loaded.trace_many(requests), gate.trace_many(requests))
+        self.assertEqual(loaded.audit(), gate.audit())
+        for item in requests:
+            args = (
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            self.assertEqual(loaded.explain(*args), gate.explain(*args))
+            self.assertEqual(loaded.trace(*args), gate.trace(*args))
+
+
 if __name__ == "__main__":
     unittest.main()
