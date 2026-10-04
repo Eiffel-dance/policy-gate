@@ -140,6 +140,28 @@ def _json_snapshot_error(kind):
     return ValueError("[non_json_value] rule snapshot contains %s" % kind)
 
 
+def _deepcopy_rule_mapping(value, index, field):
+    """Independently deep-copy one caller-provided rule mapping.
+
+    A directly constructed gate must own its rule data: without this
+    copy the normalized rule would alias the caller's mapping, so later
+    mutations of the rule dict or any nested container would silently
+    change decisions. Deep copying preserves each value's concrete
+    type and equality for every acceptable configuration; a value that
+    cannot be copied on its own aborts construction with a ValueError
+    tagged ``non_copyable_value`` (callers distinguish this from the
+    snapshot-time ``non_json_value`` failures raised for values that
+    copy perfectly but have no strict-JSON representation).
+    """
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        raise ValueError(
+            "[non_copyable_value] rule %d: field %r contains a value that "
+            "cannot be independently copied" % (index, field)
+        ) from None
+
+
 class _FixedObject:
     """A JSON object whose keys must appear in a fixed order."""
 
@@ -883,7 +905,11 @@ class PolicyGate:
     def __init__(self, rules):
         if not isinstance(rules, (list, tuple)):
             raise ValueError("rules must be a sequence of rule mappings")
-        self.rules = []
+        # Rules are validated and copied into a local list that is
+        # published as self.rules only once every rule has fully
+        # succeeded. A failure mid-way therefore leaves no partially
+        # populated instance behind.
+        normalized = []
         seen_ids = set()
         for i, r in enumerate(rules):
             if not isinstance(r, dict):
@@ -1010,7 +1036,24 @@ class PolicyGate:
                     "rule %d: unsupported field %r" % (i, sorted(unsupported)[0])
                 )
 
-            self.rules.append(
+            # All conventional validation has passed for this rule; only
+            # now take independent deep copies of the caller-owned
+            # mappings (and every nested value inside them) so the
+            # normalized rule can never alias data the caller might mutate
+            # afterwards. An un-copyable value aborts before anything is
+            # stored, so no partially copied rule ever escapes.
+            tags = _deepcopy_rule_mapping(tags, i, "tags")
+            tag_patterns = _deepcopy_rule_mapping(
+                tag_patterns, i, "tag_patterns"
+            )
+            tag_exclude_patterns = _deepcopy_rule_mapping(
+                tag_exclude_patterns, i, "tag_exclude_patterns"
+            )
+            tag_presence = _deepcopy_rule_mapping(
+                tag_presence, i, "tag_presence"
+            )
+
+            normalized.append(
                 {
                     "id": rid,
                     "effect": effect,
@@ -1028,6 +1071,11 @@ class PolicyGate:
                     "_index": i,
                 }
             )
+
+        # Every rule validated and copied successfully; only now does the
+        # gate take ownership, so construction can never expose a
+        # half-populated instance.
+        self.rules = normalized
 
     @classmethod
     def from_json(cls, document):
