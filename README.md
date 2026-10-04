@@ -77,4 +77,14 @@ Tests: python3 -m unittest discover -s tests -v
 - `audit` 把模式标签纳入重叠、遮蔽和 witness 判断：同一键的两个模式只有存在共同字符串才算可满足，精确值与模式同时出现时精确值必须匹配该模式。`witness.tags` 只包含两条规则的约束并按 Unicode 键序输出；每个模式标签取同时满足约束的最短字符串，长度相同按 Unicode 码点字典序，且 witness 能重放 finding。
 - `to_json` 在规则使用 `tag_patterns` 时按固定顺序紧跟 `tags` 导出该字段，`fingerprint` 随其变化；完全未使用新字段的规则，其 `to_json` 和 `fingerprint` 保持既有字节级结果。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
 
+## 标签排除模式约束
+
+规则还可携带可选的 `tag_exclude_patterns` 映射，声明某个标签值**不得**命中指定模式，用于表达“允许生产资源但排除临时环境”这类约束；不使用该字段的旧规则，其判定、异常、审计结果和 `to_json` 字节保持不变。
+
+- `tag_exclude_patterns` 必须是键和值均为字符串的映射；同一规则内与 `tags` 或 `tag_patterns` 出现同名键均失败。形状错误在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_tag_exclude_patterns`（非映射、非字符串键或值）或 `tag_constraint_conflict`（与 `tags` / `tag_patterns` 键冲突）；直接构造与 `from_json` 使用同一校验，不会延迟到 `decide`。未提供或为空映射按无排除处理。
+- 请求判定时排除约束逐键使用 `fnmatch.fnmatchcase`：缺少该键、值不是字符串、或字符串值不匹配排除模式，该约束都视为通过；只有字符串值命中排除模式才使规则不匹配。主体、动作、资源、`tags` 精确约束、`tag_patterns` 模式约束以及显式 deny、priority、声明顺序和默认 deny 语义全部沿用。
+- `trace` 的 `tags_match` 纳入排除约束（与精确/模式约束合取），`decide_many`、`trace_many`、`verify`、`coverage`、`compare` 的返回结构、输入校验和异常类型不变；两个 gate 各自按自己的规则判定。
+- `audit` 把排除模式纳入规则重叠、`shadowed_rule`、`effect_overlap` 和 witness：只有存在同时满足双方正向约束（subject/action/resource 模式、精确标签、`tag_patterns`）且避开双方全部 `tag_exclude_patterns` 的标签值时才报告 finding。`witness.tags` 只包含两条规则声明过的键（按 Unicode 码点顺序），无精确值的键取“满足双方正向模式且不命中双方排除模式”的最短字符串，长度相同按 Unicode 码点字典序；无法满足时不生成该 finding（包括排除模式覆盖整个正向语言、或选择器虽完全相同但规则永不可匹配的情形）。
+- `to_json` 在 `tag_patterns` 之后的固定位置导出非空 `tag_exclude_patterns`（空映射不出现在快照中，旧规则字节级快照与 `fingerprint` 不变）；映射键递归按 Unicode 码点排序。`from_json` 往返后 `decide`、`explain`、`trace`、批量入口、`audit`、`coverage`、`compare`、`verify` 结果一致；重复调用、修改返回报告均不影响规则与后续结果，功能继续无网络、无外部 I/O。
+
 
