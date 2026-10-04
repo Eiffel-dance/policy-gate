@@ -38,6 +38,17 @@ Tests: python3 -m unittest discover -s tests -v
 - `changes` 按输入顺序列出完整 `decide` 结果不同的请求，每项含 `index`、`before`、`after`、`kind`：effect 从 allow 变 deny / deny 变 allow 时 `kind` 分别为 `allow_to_deny` / `deny_to_allow`；effect 相同但 `rule` 或 `reason` 改变时为 `winner_changed`；完全相同只计入 `unchanged`。
 - 比较只读且纯离线：不修改任一 gate、请求或标签映射，无 I/O，重复调用结果相同；不改变 `decide`、`decide_many`、`explain`、`audit`、`from_json`、`to_json`、`fingerprint` 的既有行为。
 
+## 规则变更报告
+
+`PolicyGate.rule_change_report(candidate)` 在发布审查时按规则 `id` 对齐两份**已校验**配置：调用对象为基线，`candidate`（必须为 `PolicyGate`，否则抛 `TypeError`，不产生部分报告）为候选。接口纯离线、只读：不修改任一 gate 或输入对象、无 I/O，重复调用返回相等结果，修改返回报告不影响后续调用；不改变 `decide`、`explain`、`audit`、`compare`、`to_json`、`fingerprint` 的既有结果。
+
+- 返回固定结构 `{"added": [...], "removed": [...], "changed": [...], "unchanged": [...], "summary": {...}}`。
+- `added` 按候选声明顺序给出仅候选拥有的规则，`removed` 按基线声明顺序给出仅基线拥有的规则；两者使用与 `to_json` 相同的不含 `_index` 的规则快照——字段、固定字段顺序与嵌套标签键的 Unicode 码位排序完全一致（空的可选映射与未提供的排除字段同样省略）。
+- `unchanged` 按基线声明顺序给出两边配置完全相同的 id；嵌套映射仅以归一化内容比较，输入时的键插入顺序不影响判定。
+- `changed` 按基线声明顺序排列，每项固定含 `id`、`before`、`after`、`fields`、`before_index`、`after_index`：`before`/`after` 为基线/候选的规则快照，`before_index`/`after_index` 为两侧声明位置。`fields` 按固定顺序列出变化字段：`effect`、`priority`、`subject`、`action`、`resource`、`subject_exclude`、`action_exclude`、`resource_exclude`、`tags`、`tag_patterns`、`tag_exclude_patterns`、`tag_presence`；声明位置变化记为末尾的 `declaration_order`。仅位置变化（其余字段全同）也必须进入 `changed`，此时 `fields == ["declaration_order"]`。排除字段按归一化值比较（省略为 `null`，快照中不写出该键）。
+- `summary` 固定含 `baseline_total`、`candidate_total`、`added`、`removed`、`changed`、`unchanged`，后四个计数与对应数组一致；两份空配置给出全零汇总。
+- 任一快照无法按既有严格 JSON 语义表达（元组、集合、非有限数字、非字符串映射键、孤立代理项等，同直接构造后调用 `to_json` 的边界）时抛出消息含固定标记 `non_json_value` 的 `ValueError`，不返回部分报告。
+
 ## 请求覆盖报告
 
 `PolicyGate.coverage(requests)` 用一批请求检查每条规则是否参与判定及赢得多少次，纯离线、只读，不改变任何判定结果。
