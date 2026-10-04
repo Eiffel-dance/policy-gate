@@ -67,4 +67,14 @@ Tests: python3 -m unittest discover -s tests -v
 - 返回固定结构 `{"ok", "failures", "summary"}`：`summary` 含 `total`、`passed`、`failed`；`failures` 按输入顺序给出 `index`、`expected`、`actual`，`actual` 是完整决策（含 `reason`）。`failed` 为零时 `ok` 为 `true`；空批次返回空 `failures`、全零汇总和 `true`。
 - 返回内容为独立深拷贝，修改返回值不影响后续调用；重复调用、直接构造与 `from_json` 加载的同一规则结果相同。`verify` 不修改任何规则或输入、不产生外部 I/O，也不改变既有公开 API 的校验、字段、优先级与异常行为。
 
+## 标签模式约束
+
+规则可携带可选的 `tag_patterns` 映射，为一组环境或资源表达标签值的字符串模式，避免重复复制规则；不改变既有规则和任何返回结构。
+
+- `tag_patterns` 的键必须是字符串，值是按 `fnmatch.fnmatchcase` 语义解释的字符串模式；同一键不能同时出现在 `tags` 和 `tag_patterns` 中。形状错误在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_tag_patterns`（非映射、非字符串键或值）或 `tag_constraint_conflict`（键冲突），不会延迟到 `decide`。未提供该字段按空映射处理，旧规则的决定、批量行为和异常边界保持不变。
+- 请求的 `tags` 可省略或为任意 mapping；对 `tag_patterns` 而言，缺少键或对应值不是字符串只表示该规则不匹配。规则须同时满足主体、动作、资源、精确标签和所有模式标签，随后继续使用现有的显式 deny、priority、声明顺序和默认拒绝语义。
+- `explain` 与 `trace` 的字段保持不变，其中 `trace` 的 `tags_match` 反映精确与模式两类标签约束的合取；`decide_many`、`verify`、`coverage`、`compare` 的输出形状和错误码沿用当前定义。
+- `audit` 把模式标签纳入重叠、遮蔽和 witness 判断：同一键的两个模式只有存在共同字符串才算可满足，精确值与模式同时出现时精确值必须匹配该模式。`witness.tags` 只包含两条规则的约束并按 Unicode 键序输出；每个模式标签取同时满足约束的最短字符串，长度相同按 Unicode 码点字典序，且 witness 能重放 finding。
+- `to_json` 在规则使用 `tag_patterns` 时按固定顺序紧跟 `tags` 导出该字段，`fingerprint` 随其变化；完全未使用新字段的规则，其 `to_json` 和 `fingerprint` 保持既有字节级结果。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
+
 
