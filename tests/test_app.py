@@ -3661,5 +3661,475 @@ class TagPresenceTest(unittest.TestCase):
             self.assertEqual(loaded.trace(*args), gate.trace(*args))
 
 
+class SelectorExclusionTest(unittest.TestCase):
+    def test_excluded_value_falls_through_to_default_deny(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*",
+                 "resource_exclude": "data/secret*"},
+            ]
+        )
+        self.assertEqual(
+            gate.decide("s", "x", "data/ok"),
+            {"effect": "allow", "rule": "a",
+             "reason": "matched allow rule 'a' (priority 0)"},
+        )
+        self.assertEqual(
+            gate.decide("s", "x", "data/secret1"),
+            {"effect": "deny", "rule": None, "reason": "default deny"},
+        )
+
+    def test_each_dimension_excludes_independently(self):
+        gate = PolicyGate(
+            [
+                {"id": "r", "effect": "allow",
+                 "subject": "*", "subject_exclude": "tmp-*",
+                 "action": "read", "action_exclude": "read-all",
+                 "resource": "doc/*", "resource_exclude": "doc/old/*"},
+            ]
+        )
+        self.assertEqual(
+            gate.decide("alice", "read", "doc/a")["effect"], "allow"
+        )
+        self.assertEqual(
+            gate.decide("tmp-1", "read", "doc/a")["effect"], "deny"
+        )
+        self.assertEqual(
+            gate.decide("alice", "read-all", "doc/a")["effect"], "deny"
+        )
+        self.assertEqual(
+            gate.decide("alice", "read", "doc/old/a")["effect"], "deny"
+        )
+
+    def test_empty_string_exclusion_has_real_fnmatch_semantics(self):
+        gate = PolicyGate(
+            [{"id": "e", "effect": "allow", "subject_exclude": ""}]
+        )
+        # "" only matches (and therefore excludes) the empty string
+        self.assertEqual(gate.decide("bob", "a", "r")["effect"], "allow")
+        self.assertEqual(gate.decide("", "a", "r")["effect"], "deny")
+        self.assertIsNone(gate.decide("", "a", "r")["rule"])
+
+    def test_omitted_exclusion_changes_nothing(self):
+        rules = [
+            {"id": "read", "effect": "allow", "action": "read"},
+            {"id": "lock", "effect": "deny", "resource": "prod/*"},
+        ]
+        gate = PolicyGate(rules)
+        self.assertIsNone(gate.rules[0]["subject_exclude"])
+        self.assertIsNone(gate.rules[0]["action_exclude"])
+        self.assertIsNone(gate.rules[0]["resource_exclude"])
+        self.assertEqual(gate.decide("a", "read", "prod/db")["rule"], "lock")
+        self.assertEqual(gate.decide("a", "read", "dev/db")["rule"], "read")
+
+    def test_exclusion_does_not_weaken_explicit_deny_or_priority(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "priority": 100},
+                {"id": "d", "effect": "deny", "priority": -5,
+                 "subject_exclude": "nobody"},
+            ]
+        )
+        result = gate.decide("alice", "x", "y")
+        self.assertEqual(result["effect"], "deny")
+        self.assertEqual(result["rule"], "d")
+        self.assertIn("overrides allow", result["reason"])
+        # the deny rule excludes "nobody", so the allow wins there
+        self.assertEqual(gate.decide("nobody", "x", "y")["rule"], "a")
+
+    def test_exclusion_participates_in_winner_tie_break(self):
+        gate = PolicyGate(
+            [
+                {"id": "low", "effect": "allow", "priority": 1},
+                {"id": "high", "effect": "allow", "priority": 9,
+                 "action_exclude": "read"},
+            ]
+        )
+        self.assertEqual(gate.decide("s", "write", "r")["rule"], "high")
+        self.assertEqual(gate.decide("s", "read", "r")["rule"], "low")
+
+    # --- load-time validation --------------------------------------
+
+    def _expect_exclusion_error(self, rules, index, field):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate(rules)
+        message = str(ctx.exception)
+        self.assertTrue(
+            message.startswith("invalid_selector_exclusion"), message
+        )
+        self.assertIn("rule %d" % index, message)
+        self.assertIn(field, message)
+
+    def test_non_string_exclusions_rejected(self):
+        for field in ("subject_exclude", "action_exclude",
+                      "resource_exclude"):
+            for bad in (1, 1.5, None, True, ["x"], {"k": "v"}):
+                self._expect_exclusion_error(
+                    [{"effect": "allow", field: bad}], 0, field
+                )
+
+    def test_error_names_first_offending_index(self):
+        self._expect_exclusion_error(
+            [
+                {"id": "ok", "effect": "allow", "subject_exclude": "tmp*"},
+                {"id": "bad", "effect": "deny", "resource_exclude": 3},
+            ],
+            1,
+            "resource_exclude",
+        )
+
+    def test_from_json_raises_same_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow"},'
+                '{"effect": "deny", "action_exclude": ["read"]}]'
+            )
+        self.assertNotIsInstance(ctx.exception, PolicyConfigError)
+        message = str(ctx.exception)
+        self.assertTrue(message.startswith("invalid_selector_exclusion"))
+        self.assertIn("rule 1", message)
+        self.assertIn("action_exclude", message)
+
+    def test_empty_string_exclusion_loads(self):
+        gate = PolicyGate.from_json(
+            '[{"effect": "allow", "subject_exclude": ""}]'
+        )
+        self.assertEqual(gate.rules[0]["subject_exclude"], "")
+
+    def test_unknown_fields_still_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate([{"effect": "allow", "subject_exclud": "x"}])
+        self.assertIn("unsupported field", str(ctx.exception))
+
+    # --- trace / explain --------------------------------------------
+
+    def test_trace_flags_are_positive_match_and_exclusion_conjunction(self):
+        gate = PolicyGate(
+            [
+                {"id": "r", "effect": "allow",
+                 "subject": "a*", "subject_exclude": "admin*",
+                 "action": "read", "action_exclude": "",
+                 "resource": "doc/*", "resource_exclude": "doc/x"},
+            ]
+        )
+        excluded_subject = gate.trace("admin1", "read", "doc/a")
+        ev = excluded_subject["evaluations"][0]
+        self.assertFalse(ev["subject_match"])
+        self.assertTrue(ev["action_match"])
+        self.assertTrue(ev["resource_match"])
+        self.assertFalse(ev["matched"])
+        # empty-string exclusion fails the empty action only
+        empty_action = gate.trace("alice", "", "doc/a")
+        self.assertFalse(empty_action["evaluations"][0]["action_match"])
+        excluded_resource = gate.trace("alice", "read", "doc/x")
+        self.assertFalse(excluded_resource["evaluations"][0]["resource_match"])
+        ok = gate.trace("alice", "read", "doc/a")
+        self.assertTrue(ok["evaluations"][0]["matched"])
+        self.assertTrue(ok["evaluations"][0]["selected"])
+        self.assertEqual(ok["rule"], "r")
+
+    def test_explain_lists_only_unexcluded_rules(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "resource": "data/*", "resource_exclude": "data/s*"},
+                {"id": "b", "effect": "allow", "resource": "data/*"},
+            ]
+        )
+        explanation = gate.explain("s", "x", "data/secret")
+        self.assertEqual(
+            explanation["matched_rules"],
+            [{"id": "b", "effect": "allow", "priority": 0}],
+        )
+
+    # --- batch APIs --------------------------------------------------
+
+    def test_batch_apis_honor_exclusions(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*",
+                 "resource_exclude": "data/secret*"},
+            ]
+        )
+        requests = [
+            {"subject": "s", "action": "x", "resource": "data/ok"},
+            {"subject": "s", "action": "x", "resource": "data/secret9"},
+        ]
+        decisions = gate.decide_many(requests)
+        self.assertEqual(
+            [d["effect"] for d in decisions["decisions"]], ["allow", "deny"]
+        )
+        self.assertEqual(
+            decisions["summary"], {"total": 2, "allow": 1, "deny": 1}
+        )
+        traces = gate.trace_many(requests)
+        self.assertTrue(traces["traces"][0]["evaluations"][0]["matched"])
+        self.assertFalse(traces["traces"][1]["evaluations"][0]["matched"])
+        coverage = gate.coverage(requests)
+        self.assertEqual(
+            coverage["rules"],
+            [{"id": "a", "effect": "allow", "matched": 1, "winner": 1}],
+        )
+        self.assertEqual(coverage["summary"]["default_deny"], 1)
+        self.assertEqual(coverage["summary"]["matched_request"], 1)
+        verification = gate.verify(
+            [
+                {"subject": "s", "action": "x", "resource": "data/ok",
+                 "expected": {"effect": "allow", "rule": "a"}},
+                {"subject": "s", "action": "x", "resource": "data/secret9",
+                 "expected": {"effect": "deny", "rule": None}},
+            ]
+        )
+        self.assertTrue(verification["ok"])
+        self.assertEqual(
+            verification["summary"], {"total": 2, "passed": 2, "failed": 0}
+        )
+
+    def test_compare_sees_exclusion_effect(self):
+        baseline = PolicyGate(
+            [{"id": "a", "effect": "allow", "resource": "data/*"}]
+        )
+        candidate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*",
+                 "resource_exclude": "data/secret*"},
+            ]
+        )
+        report = baseline.compare(
+            candidate,
+            [
+                {"subject": "s", "action": "x", "resource": "data/ok"},
+                {"subject": "s", "action": "x", "resource": "data/secret9"},
+            ],
+        )
+        self.assertEqual(report["summary"]["allow_to_deny"], 1)
+        self.assertEqual(report["changes"][0]["index"], 1)
+        self.assertIsNone(report["changes"][0]["after"]["rule"])
+
+    # --- snapshot ----------------------------------------------------
+
+    def test_unused_fields_keep_legacy_snapshot_bytes(self):
+        gate = PolicyGate(
+            [
+                {"id": "read", "effect": "allow", "action": "read"},
+                {"effect": "deny", "resource": "secret/*",
+                 "tags": {"env": "prod"}},
+            ]
+        )
+        self.assertEqual(
+            gate.to_json(),
+            '[{"id":"read","effect":"allow","priority":0,"subject":"*",'
+            '"action":"read","resource":"*","tags":{}},'
+            '{"id":"1","effect":"deny","priority":0,"subject":"*",'
+            '"action":"*","resource":"secret/*","tags":{"env":"prod"}}]',
+        )
+
+    def test_exclusions_export_after_resource_in_fixed_order(self):
+        gate = PolicyGate(
+            [
+                {"effect": "allow", "resource_exclude": "x*",
+                 "subject_exclude": "tmp*",
+                 "action_exclude": "", "tags": {"k": "v"}},
+            ]
+        )
+        import json
+
+        keys = list(json.loads(gate.to_json())[0])
+        self.assertEqual(
+            keys,
+            ["id", "effect", "priority", "subject", "action", "resource",
+             "subject_exclude", "action_exclude", "resource_exclude",
+             "tags"],
+        )
+        document = gate.to_json()
+        self.assertIn('"subject_exclude":"tmp*"', document)
+        self.assertIn('"action_exclude":""', document)
+        self.assertIn('"resource_exclude":"x*"', document)
+
+    def test_fingerprint_changes_with_exclusions(self):
+        plain = PolicyGate([{"effect": "allow"}])
+        excluded = PolicyGate(
+            [{"effect": "allow", "subject_exclude": "tmp*"}]
+        )
+        self.assertNotEqual(plain.fingerprint(), excluded.fingerprint())
+        import hashlib
+
+        self.assertEqual(
+            excluded.fingerprint(),
+            hashlib.sha256(excluded.to_json().encode("utf-8")).hexdigest(),
+        )
+
+    def test_roundtrip_preserves_exclusion_behavior(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*",
+                 "resource_exclude": "data/secret*", "priority": 3},
+                {"id": "d", "effect": "deny", "subject_exclude": "",
+                 "action_exclude": "read-all"},
+            ]
+        )
+        loaded = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(loaded.to_json(), gate.to_json())
+        self.assertEqual(loaded.fingerprint(), gate.fingerprint())
+        requests = [
+            {"subject": "s", "action": "x", "resource": "data/ok"},
+            {"subject": "s", "action": "x", "resource": "data/secret1"},
+            {"subject": "", "action": "read", "resource": "r"},
+            {"subject": "s", "action": "read-all", "resource": "r"},
+        ]
+        self.assertEqual(loaded.decide_many(requests),
+                         gate.decide_many(requests))
+        self.assertEqual(loaded.trace_many(requests),
+                         gate.trace_many(requests))
+        self.assertEqual(loaded.coverage(requests), gate.coverage(requests))
+        self.assertEqual(loaded.audit(), gate.audit())
+        for item in requests:
+            args = (item["subject"], item["action"], item["resource"])
+            self.assertEqual(loaded.decide(*args), gate.decide(*args))
+            self.assertEqual(loaded.explain(*args), gate.explain(*args))
+
+    # --- audit ---------------------------------------------------------
+
+    def test_audit_exclusion_can_remove_overlap(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*"},
+                {"id": "d", "effect": "deny", "resource": "data/*",
+                 "resource_exclude": "data/*"},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_audit_overlap_around_exclusion(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*"},
+                {"id": "d", "effect": "deny", "resource": "data/*",
+                 "resource_exclude": "data/sec*"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+        self.assertEqual(finding["winner"], "d")
+        self.assertEqual(finding["witness"]["resource"], "data/")
+
+    def test_identical_selectors_require_identical_exclusions(self):
+        different = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "action": "read"},
+                {"id": "d", "effect": "deny", "action": "read",
+                 "action_exclude": "readx"},
+            ]
+        )
+        (finding,) = different.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+        same = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "action": "read",
+                 "action_exclude": "readx"},
+                {"id": "d", "effect": "deny", "action": "read",
+                 "action_exclude": "readx"},
+            ]
+        )
+        (finding,) = same.audit()["findings"]
+        self.assertEqual(finding["code"], "shadowed_rule")
+        self.assertEqual(finding["severity"], "error")
+        self.assertEqual(finding["winner"], "d")
+        self.assertEqual(finding["shadowed"], "a")
+        self.assertEqual(finding["witness"]["action"], "read")
+
+    def test_witness_avoids_both_sides_exclusions(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "subject": "[a-c]*",
+                 "subject_exclude": "a*"},
+                {"id": "d", "effect": "deny", "subject": "*",
+                 "subject_exclude": "b?*"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        # "a*" excluded by the allow, "b"+char excluded by the deny, so
+        # the shortest common subject is "b"
+        self.assertEqual(finding["witness"]["subject"], "b")
+        self.assertWitnessTriggers(gate, finding)
+
+    def test_witness_shortest_then_codepoint_order_with_exclusions(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "action": "?"},
+                {"id": "d", "effect": "deny", "action": "*",
+                 "action_exclude": "a"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["action"], "\x00")
+        self.assertWitnessTriggers(gate, finding)
+
+    def test_unsatisfiable_dimension_means_no_finding(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "subject": "x",
+                 "subject_exclude": "x"},
+                {"id": "d", "effect": "deny"},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_empty_string_exclusion_carves_out_empty_witness(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "action": "[ab]"},
+                {"id": "d", "effect": "deny", "action": "*",
+                 "action_exclude": ""},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["action"], "a")
+        self.assertWitnessTriggers(gate, finding)
+
+    def test_audit_stable_and_mutation_isolated_with_exclusions(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "resource": "data/*"},
+                {"id": "d", "effect": "deny", "resource": "data/*",
+                 "resource_exclude": "data/sec*"},
+            ]
+        )
+        first = gate.audit()
+        for _ in range(10):
+            self.assertEqual(gate.audit(), first)
+        first["findings"][0]["witness"]["resource"] = "tampered"
+        fresh = gate.audit()
+        self.assertEqual(fresh["findings"][0]["witness"]["resource"],
+                         "data/")
+
+    def assertWitnessTriggers(self, gate, finding):
+        witness = finding["witness"]
+        self.assertEqual(
+            set(witness), {"subject", "action", "resource", "tags"}
+        )
+        rules = {r["id"]: r for r in gate.rules}
+        for rid in (finding["rule"], finding["other_rule"]):
+            self.assertTrue(
+                PolicyGate._matches(
+                    rules[rid],
+                    witness["subject"],
+                    witness["action"],
+                    witness["resource"],
+                    witness["tags"],
+                ),
+                "witness %r does not match rule %r" % (witness, rid),
+            )
+        explanation = gate.explain(
+            witness["subject"],
+            witness["action"],
+            witness["resource"],
+            witness["tags"],
+        )
+        matched_ids = [m["id"] for m in explanation["matched_rules"]]
+        self.assertIn(finding["rule"], matched_ids)
+        self.assertIn(finding["other_rule"], matched_ids)
+
+
 if __name__ == "__main__":
     unittest.main()

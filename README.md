@@ -96,4 +96,13 @@ Tests: python3 -m unittest discover -s tests -v
 - `audit` 把存在性条件纳入重叠、`shadowed_rule`、`effect_overlap` 与 witness 判断：要求存在与要求缺失的同键（或要求缺失的键被另一规则的精确/模式约束钉住）视为不可满足，不生成 finding；仅被排除模式约束的缺失键因缺席而通过排除。`witness.tags` 只包含两条规则声明的键并按 Unicode 码点排序；要求缺失的键不写入，仅要求存在且无其他值约束的键取满足双方条件的最短字符串（长度相同取 Unicode 码点字典序最小者），其余精确、模式和排除约束沿用既有见证规则。
 - `to_json` 在规则使用 `tag_presence` 时按固定位置在 `tags`、`tag_patterns`、`tag_exclude_patterns` 之后导出该字段，键递归按 Unicode 码点排序，`fingerprint` 随其变化；空字段不改变旧快照。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
 
+## 选择器排除模式
+
+规则可携带可选的 `subject_exclude`、`action_exclude`、`resource_exclude` 三个字符串字段，声明对应维度不得命中的 `fnmatch.fnmatchcase` 模式，从而表达“允许所有读操作但排除批量导出”一类的反向选择器；不改变既有规则和任何返回结构。
+
+- 三个字段各自独立：未提供表示该维度无排除；提供后必须是字符串，空字符串也按 `fnmatch.fnmatchcase` 真实语义处理（仅排除空字符串）。类型错误在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_selector_exclusion` 并带规则索引与字段名，不会延迟到 `decide`；未知字段、其他配置错误和异常优先级沿用既有定义。
+- 请求只有在正向选择器匹配且未命中该维度排除模式时才命中规则，三个维度与标签约束合取；默认拒绝、显式 deny 优先、同效果按 priority 与声明顺序决胜完全沿用。`decide`、`explain`、`trace`、`decide_many`、`trace_many`、`verify`、`coverage`、`compare` 的输出形状和错误码不变，其中 `trace` 的 `subject_match`、`action_match`、`resource_match` 分别表示正向匹配与排除检查的合取。
+- `audit` 把排除模式纳入重叠、`shadowed_rule`、`effect_overlap` 与选择器相同性判断：只有存在同时满足双方正向模式且避开双方排除模式的主体/动作/资源字符串时才报告 finding；任一维度无可满足字符串就不生成 finding。`witness` 的三个字符串字段各自独立地取满足上述条件的最短字符串，长度相同按 Unicode 码点字典序取小，交回 `decide`/`explain` 仍同时命中两条规则；重复审计结果稳定，修改返回报告不影响后续调用。
+- `to_json` 在规则使用这些字段时按 `subject_exclude`、`action_exclude`、`resource_exclude` 的固定顺序紧跟 `resource` 导出（仅导出实际提供的字段，显式空字符串照常写出），`fingerprint` 随其变化；完全未使用新字段的规则，其判定、审计结果、`to_json` 字节和 `fingerprint` 保持既有结果。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
+
 
