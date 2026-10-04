@@ -87,4 +87,14 @@ Tests: python3 -m unittest discover -s tests -v
 - `audit` 把排除模式纳入重叠、`shadowed_rule`、`effect_overlap` 和 witness 判断：只有存在同时满足双方正向约束且避开双方排除模式的标签值时才报告 finding。`witness.tags` 只包含两条规则声明过的键（含仅出现在 `tag_exclude_patterns` 中的键），按键的 Unicode 码点序输出；每个键取能重放 finding 的最短字符串，长度相同按 Unicode 码点字典序，某键无可选值时不生成该 finding。
 - `to_json` 在规则使用 `tag_exclude_patterns` 时按固定位置在 `tags`（及 `tag_patterns`）之后导出该字段，键递归按 Unicode 码点排序，`fingerprint` 随其变化；空映射不改变旧快照。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
 
+## 标签键存在性约束
+
+规则可携带可选的 `tag_presence` 映射，只约束某个标签键是否存在，从而区分“标签缺失”与“标签值不匹配”；不改变既有规则和任何返回结构。
+
+- `tag_presence` 的键必须是字符串，值只能是布尔值：`true` 表示请求 `tags` 必须包含该键（值可为任意类型，包括 `null`），`false` 表示该键必须不存在。同一键不能同时出现在 `tag_presence` 与 `tags`、`tag_patterns`、`tag_exclude_patterns` 任意两个之中。形状错误在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_tag_presence`（非对象、非字符串键或非布尔值）或 `tag_presence_conflict`（键冲突），不会延迟到 `decide`。未提供该字段按空对象处理，旧规则的判定、审计结果、序列化文本和 `fingerprint` 保持不变。
+- 判定时 `tags=None` 仍按空映射处理；规则须同时满足存在性条件、已有精确/模式/排除标签条件以及主体、动作、资源模式，随后继续使用现有的显式 deny、priority、声明顺序和默认拒绝语义。
+- `explain` 与 `trace` 的字段保持不变，其中 `trace` 的 `tags_match` 反映存在性、精确、模式与排除标签条件的合取；`decide_many`、`trace_many`、`verify`、`coverage`、`compare` 使用同一语义，输出形状、批量校验和异常代码沿用当前定义。
+- `audit` 把存在性条件纳入重叠、`shadowed_rule`、`effect_overlap` 与 witness 判断：同一键一方要求存在、另一方要求缺失视为不可满足，不生成 finding；要求缺失与该键的精确值或正向模式同样不可满足；要求缺失仅面对排除模式时可由省略该键满足。`witness.tags` 只能包含两条规则声明的键并按 Unicode 码点排序：要求缺失的键不得写入；仅要求存在且无其他值约束的键取满足双方条件的最短字符串（即空字符串），长度相同时取 Unicode 码点字典序最小值；精确、模式和排除约束沿用当前见证规则。
+- `to_json` 在现有标签字段之后固定导出非空 `tag_presence`（位于 `tag_exclude_patterns` 之后），键递归按 Unicode 码点排序；空字段不改变旧快照，`fingerprint` 随快照变化。导出文本可由 `from_json` 无损加载，重复调用及直接构造/`from_json` 两种方式的公开行为一致，功能继续无网络、无外部 I/O。
+
 

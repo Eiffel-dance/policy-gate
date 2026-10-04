@@ -17,6 +17,7 @@ _ALLOWED_FIELDS = frozenset(
         "tags",
         "tag_patterns",
         "tag_exclude_patterns",
+        "tag_presence",
     }
 )
 _STRING_FIELDS = ("subject", "action", "resource")
@@ -583,15 +584,40 @@ def _tag_constraints_compatible(r1, r2, tp1, tp2, te1, te2):
     string hitting an exclusion pattern, and a pattern- or
     exclusion-only key needs one string that satisfies its positive
     patterns (if any) while matching none of the exclusion patterns.
+
+    ``tag_presence`` constrains mere key existence: requiring a key
+    present on one side and absent on the other is unsatisfiable, as is
+    an absence requirement facing an exact or positive-pattern
+    constraint on the same key (both demand the key exist). An absence
+    requirement facing only exclusion patterns is always satisfiable by
+    simply omitting the key, since an omitted key passes every
+    exclusion.
     """
     tags1, pats1 = r1["tags"], r1["tag_patterns"]
     tags2, pats2 = r2["tags"], r2["tag_patterns"]
+    pres1, pres2 = r1["tag_presence"], r2["tag_presence"]
     for tokens in tp1.values():
         if not _pattern_satisfiable(tokens):
             return False
     for tokens in tp2.values():
         if not _pattern_satisfiable(tokens):
             return False
+    for key in set(pres1) & set(pres2):
+        # one side requires the key present, the other absent
+        if pres1[key] != pres2[key]:
+            return False
+    for rule_pres, rule_tags, rule_pats, other_tags, other_pats in (
+        (pres1, tags1, pats1, tags2, pats2),
+        (pres2, tags2, pats2, tags1, pats1),
+    ):
+        for key, present in rule_pres.items():
+            if not present and (
+                key in rule_tags
+                or key in rule_pats
+                or key in other_tags
+                or key in other_pats
+            ):
+                return False
     for key, value in tags1.items():
         if key in tags2:
             if tags2[key] != value:
@@ -605,6 +631,10 @@ def _tag_constraints_compatible(r1, r2, tp1, tp2, te1, te2):
         if key in pats2 and not _patterns_overlap(tp1[key], tp2[key]):
             return False
     for key in set(te1) | set(te2):
+        # A key required absent by either rule satisfies every
+        # exclusion on both sides simply by being omitted.
+        if pres1.get(key) is False or pres2.get(key) is False:
+            continue
         if key in tags1 or key in tags2:
             value = tags1[key] if key in tags1 else tags2[key]
             for rule in (r1, r2):
@@ -633,14 +663,17 @@ def _witness_tags(r1, r2, tp1, tp2, te1, te2):
     """Joint tag assignment satisfying both rules' tag constraints.
 
     Only keys constrained by one of the two rules appear — whether in
-    ``tags``, ``tag_patterns`` or ``tag_exclude_patterns`` — emitted in
-    Unicode code-point order. An exact constraint pins the value (a
-    shared exact/pattern key takes the exact value, which the
-    compatibility check has already proven to match every positive
-    pattern and avoid every exclusion); a key constrained only by
-    patterns and exclusions takes the shortest string satisfying every
-    positive pattern on it and matching none of its exclusion patterns,
-    ties broken by Unicode code-point lexicographic order. Exact values
+    ``tags``, ``tag_patterns``, ``tag_exclude_patterns`` or
+    ``tag_presence`` — emitted in Unicode code-point order. A key that
+    either rule requires to be absent is never written at all (omission
+    is its witness). An exact constraint pins the value (a shared
+    exact/pattern key takes the exact value, which the compatibility
+    check has already proven to match every positive pattern and avoid
+    every exclusion); a key constrained only by patterns and exclusions
+    takes the shortest string satisfying every positive pattern on it
+    and matching none of its exclusion patterns, ties broken by Unicode
+    code-point lexicographic order; a key that only has to be present
+    takes the shortest possible string (the empty string). Exact values
     are deep-copied (direct construction permits mutable tag values) so
     a caller mutating a returned report can never touch the loaded rules
     or later reports.
@@ -649,12 +682,18 @@ def _witness_tags(r1, r2, tp1, tp2, te1, te2):
         set(r1["tags"])
         | set(r1["tag_patterns"])
         | set(r1["tag_exclude_patterns"])
+        | set(r1["tag_presence"])
         | set(r2["tags"])
         | set(r2["tag_patterns"])
         | set(r2["tag_exclude_patterns"])
+        | set(r2["tag_presence"])
     )
+    pres1, pres2 = r1["tag_presence"], r2["tag_presence"]
     merged = {}
     for key in keys:
+        required_absent = pres1.get(key) is False or pres2.get(key) is False
+        if required_absent:
+            continue
         exact = None
         have_exact = False
         patterns = []
@@ -673,8 +712,11 @@ def _witness_tags(r1, r2, tp1, tp2, te1, te2):
             merged[key] = _min_string_avoiding(patterns, negatives)
         elif len(patterns) == 1:
             merged[key] = _min_pattern_string(patterns[0])
-        else:
+        elif patterns:
             merged[key] = _min_common_string(patterns[0], patterns[1])
+        else:
+            # presence-only key: the shortest string that can exist
+            merged[key] = ""
     return {key: merged[key] for key in sorted(merged)}
 
 
@@ -740,6 +782,7 @@ def _audit_pair(r1, r2, c1, c2):
         and r1["tags"] == r2["tags"]
         and r1["tag_patterns"] == r2["tag_patterns"]
         and r1["tag_exclude_patterns"] == r2["tag_exclude_patterns"]
+        and r1["tag_presence"] == r2["tag_presence"]
     )
     if identical:
         # Identical selectors: one rule can never win, so it is shadowed.
@@ -891,6 +934,30 @@ class PolicyGate:
                     "both %r and 'tag_exclude_patterns'" % (i, key, other)
                 )
 
+            tag_presence = r.get("tag_presence", {})
+            if (
+                not isinstance(tag_presence, dict)
+                or not all(isinstance(k, str) for k in tag_presence)
+                or not all(
+                    isinstance(v, bool) for v in tag_presence.values()
+                )
+            ):
+                raise ValueError(
+                    "invalid_tag_presence: rule %d: field 'tag_presence' "
+                    "must be a mapping with string keys and boolean values" % i
+                )
+
+            shared_presence_keys = sorted(
+                (set(tags) | set(tag_patterns) | set(tag_exclude_patterns))
+                & set(tag_presence)
+            )
+            if shared_presence_keys:
+                raise ValueError(
+                    "tag_presence_conflict: rule %d: key %r appears in "
+                    "both 'tag_presence' and another tag constraint field"
+                    % (i, shared_presence_keys[0])
+                )
+
             unsupported = set(r) - _ALLOWED_FIELDS
             if unsupported:
                 raise ValueError(
@@ -908,6 +975,7 @@ class PolicyGate:
                     "tags": tags,
                     "tag_patterns": tag_patterns,
                     "tag_exclude_patterns": tag_exclude_patterns,
+                    "tag_presence": tag_presence,
                     "_index": i,
                 }
             )
@@ -979,9 +1047,10 @@ class PolicyGate:
         internal ``_index`` never leaks; the copy is shallow, and only read
         by the serializer, so neither the rules nor caller-provided
         mappings are mutated. ``tag_patterns`` is appended right after
-        ``tags`` only when non-empty, and ``tag_exclude_patterns`` right
-        after it under the same rule, so rules that never use pattern
-        constraints keep their legacy byte-level snapshot.
+        ``tags`` only when non-empty, ``tag_exclude_patterns`` right after
+        it under the same rule, and ``tag_presence`` right after that, so
+        rules that never use the optional tag constraints keep their
+        legacy byte-level snapshot.
         """
         snapshot = []
         for rule in self.rules:
@@ -992,6 +1061,8 @@ class PolicyGate:
                 pairs.append(
                     ("tag_exclude_patterns", rule["tag_exclude_patterns"])
                 )
+            if rule["tag_presence"]:
+                pairs.append(("tag_presence", rule["tag_presence"]))
             snapshot.append(_FixedObject(pairs))
         return snapshot
 
@@ -1006,7 +1077,9 @@ class PolicyGate:
         mapping writes it in the same fixed order immediately after
         ``tags``, and a rule with a non-empty ``tag_exclude_patterns``
         mapping writes it immediately after that, while rules without
-        pattern constraints export exactly the same bytes as before. Tag objects (at every nesting level)
+        pattern constraints export exactly the same bytes as before; a
+        rule with a non-empty ``tag_presence`` mapping writes it last,
+        immediately after ``tag_exclude_patterns``. Tag objects (at every nesting level)
         have their keys sorted by Unicode code point; separators are
         compact and non-ASCII characters are emitted unescaped. An empty
         rule set exports as ``[]`` and repeated calls return identical
@@ -1041,7 +1114,11 @@ class PolicyGate:
         # rule does not match. Exclusion constraints invert the pattern
         # test: a missing key, a non-string value or a value that does
         # not match the exclusion pattern all pass, and only an actual
-        # hit makes the rule not match.
+        # hit makes the rule not match. Presence constraints only look at
+        # key existence: a true value requires the key to be present (its
+        # value may be any type, including null), a false value requires
+        # the key to be absent, distinguishing a missing tag from a tag
+        # whose value merely fails another constraint.
         return (
             all(tags.get(k) == v for k, v in rule["tags"].items())
             and all(
@@ -1051,6 +1128,10 @@ class PolicyGate:
             and all(
                 not _value_matches_pattern(tags.get(k), pattern)
                 for k, pattern in rule["tag_exclude_patterns"].items()
+            )
+            and all(
+                (k in tags) if present else (k not in tags)
+                for k, present in rule["tag_presence"].items()
             )
         )
 
@@ -1302,8 +1383,8 @@ class PolicyGate:
         ``invalid_expectation`` for an illegal ``expected`` value.
 
         After validation, cases are evaluated in input order using the
-        existing :meth:`decide` semantics (glob matching, exact, pattern
-        and exclusion tag constraints, explicit deny, priority,
+        existing :meth:`decide` semantics (glob matching, exact, pattern,
+        exclusion and presence tag constraints, explicit deny, priority,
         declaration order and
         default deny). A case passes only when both ``effect`` and
         ``rule`` equal the actual decision; ``reason`` never participates.
@@ -1368,8 +1449,8 @@ class PolicyGate:
         "matched", "winner"}``: ``matched`` counts the requests whose
         subject/action/resource matched the rule's glob patterns under
         ``fnmatch.fnmatchcase`` semantics together with its exact,
-        pattern and exclusion tag constraints, and ``winner`` counts the
-        requests the rule
+        pattern, exclusion and presence tag constraints, and ``winner``
+        counts the requests the rule
         actually decided after explicit-deny precedence, priority and
         declaration-order tie-breaking. A request matching several rules
         raises every matched rule's ``matched`` but only the final
@@ -1539,12 +1620,14 @@ class PolicyGate:
         The first three flags compare subject/action/resource against the
         rule's glob patterns with ``fnmatch.fnmatchcase``; ``tags_match``
         is the conjunction of the rule's exact tag constraints, its
-        ``tag_patterns`` pattern constraints and its
-        ``tag_exclude_patterns`` exclusion constraints (``tags=None``
+        ``tag_patterns`` pattern constraints, its
+        ``tag_exclude_patterns`` exclusion constraints and its
+        ``tag_presence`` key-existence constraints (``tags=None``
         counts as an empty mapping; a missing key or non-string value
         fails a positive pattern constraint but passes an exclusion,
         and only a value actually matching an exclusion pattern fails
-        it). ``matched`` is the conjunction of the four
+        it; a presence-true key must exist with a value of any type and
+        a presence-false key must be absent). ``matched`` is the conjunction of the four
         flags; ``selected`` is true only on the final winning rule, and
         false everywhere when the request falls through to the default
         deny (``rule`` is then ``None``).
@@ -1638,12 +1721,17 @@ class PolicyGate:
         matter) and, for every key constrained by either rule, some tag
         value satisfies both sides' positive constraints while matching
         none of their ``tag_exclude_patterns`` exclusion patterns (an
-        exact value must avoid them too). Overlapping selectors with
+        exact value must avoid them too). A ``tag_presence`` constraint
+        only tests key existence: one side requiring a key present and
+        the other requiring it absent is unsatisfiable, and an absence
+        requirement is likewise unsatisfiable against an exact or
+        positive-pattern constraint on the same key; against exclusion
+        patterns alone it is satisfiable by omitting the key. Overlapping selectors with
         different effects yield one
         ``effect_overlap`` error finding whose winner is the deny rule —
         explicit deny overrides allow, and priority cannot change that.
-        Selectors with identical pattern texts, tags and exclusion
-        patterns yield one
+        Selectors with identical pattern texts, tags, exclusion
+        patterns and presence maps yield one
         ``shadowed_rule`` finding instead: an error when deny shadows
         allow, a warning when same-effect rules collide (the loser by
         priority, then declaration order, is shadowed). Same-effect
@@ -1679,7 +1767,12 @@ class PolicyGate:
         ``tag_exclude_patterns`` takes the shortest string avoiding
         every exclusion on it, and a pair whose exclusions leave no
         usable value for some declared key produces no finding at all;
-        a key with an exact constraint keeps that exact value. Rules
+        a key with an exact constraint keeps that exact value. A key
+        required absent by either rule's ``tag_presence`` is omitted
+        from the witness entirely (omission satisfies the absence and
+        every exclusion), and a key that only has to be present with no
+        other value constraint takes the shortest existing value, the
+        empty string. Rules
         built directly and via from_json produce identical witnesses,
         repeated calls return equal results, and mutating a returned
         report never affects later calls.
