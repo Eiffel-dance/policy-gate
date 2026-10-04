@@ -14,6 +14,9 @@ _ALLOWED_FIELDS = frozenset(
         "subject",
         "action",
         "resource",
+        "subject_exclude",
+        "action_exclude",
+        "resource_exclude",
         "tags",
         "tag_patterns",
         "tag_exclude_patterns",
@@ -21,6 +24,7 @@ _ALLOWED_FIELDS = frozenset(
     }
 )
 _STRING_FIELDS = ("subject", "action", "resource")
+_EXCLUSION_FIELDS = ("subject_exclude", "action_exclude", "resource_exclude")
 _REQUEST_FIELDS = frozenset({"subject", "action", "resource", "tags"})
 _CASE_FIELDS = frozenset(
     {"subject", "action", "resource", "tags", "expected"}
@@ -568,6 +572,32 @@ def _value_matches_pattern(value, pattern):
     return isinstance(value, str) and fnmatch.fnmatchcase(value, pattern)
 
 
+def _dimension_matches(value, pattern, exclude):
+    # One selector dimension (subject, action or resource) hits a rule
+    # when the value matches the positive glob pattern and does not hit
+    # the dimension's exclusion pattern; a missing exclusion (None)
+    # excludes nothing, while an empty-string exclusion is a real
+    # fnmatch.fnmatchcase pattern (it excludes only the empty string).
+    return fnmatch.fnmatchcase(value, pattern) and (
+        exclude is None or not fnmatch.fnmatchcase(value, exclude)
+    )
+
+
+def _dimension_witness(t1, t2, e1, e2):
+    """Shortest string matching both tokenized positive patterns of one
+    selector dimension while matching none of the pair's tokenized
+    exclusion patterns (None entries stand for "no exclusion"); ties
+    broken by Unicode code-point lexicographic order. Returns None when
+    no string qualifies, which also settles the dimension's overlap
+    question for the audit. Dimensions without any exclusion keep the
+    legacy pairwise-minimum computation exactly.
+    """
+    negatives = [e for e in (e1, e2) if e is not None]
+    if not negatives:
+        return _min_common_string(t1, t2)
+    return _min_string_avoiding([t1, t2], negatives)
+
+
 def _tag_constraints_compatible(r1, r2, tp1, tp2, te1, te2):
     """True iff one tag assignment can satisfy both rules' constraints.
 
@@ -718,13 +748,18 @@ def _witness_tags(r1, r2, tp1, tp2, te1, te2):
     return {key: merged[key] for key in sorted(merged)}
 
 
-def _pair_witness(r1, r2, c1, c2):
-    """Minimum request matching both selectors of one audited pair."""
+def _pair_witness(r1, r2, c1, c2, dimensions):
+    """Minimum request matching both selectors of one audited pair.
+
+    ``dimensions`` holds the already-computed (subject, action, resource)
+    witness strings; each satisfies both rules' positive patterns of that
+    dimension while avoiding both rules' exclusion patterns.
+    """
     return {
-        "subject": _min_common_string(c1[0], c2[0]),
-        "action": _min_common_string(c1[1], c2[1]),
-        "resource": _min_common_string(c1[2], c2[2]),
-        "tags": _witness_tags(r1, r2, c1[3], c2[3], c1[4], c2[4]),
+        "subject": dimensions[0],
+        "action": dimensions[1],
+        "resource": dimensions[2],
+        "tags": _witness_tags(r1, r2, c1[6], c2[6], c1[7], c2[7]),
     }
 
 
@@ -765,18 +800,26 @@ def _patterns_overlap(t1, t2):
 
 def _audit_pair(r1, r2, c1, c2):
     """Build the finding for one rule pair, or None when there is none."""
-    if not (
-        _patterns_overlap(c1[0], c2[0])
-        and _patterns_overlap(c1[1], c2[1])
-        and _patterns_overlap(c1[2], c2[2])
-        and _tag_constraints_compatible(r1, r2, c1[3], c2[3], c1[4], c2[4])
-    ):
+    # Each dimension needs one string that satisfies both rules' positive
+    # patterns and avoids both rules' exclusion patterns; a dimension
+    # with no such string means the pair can never match one request.
+    dimensions = (
+        _dimension_witness(c1[0], c2[0], c1[3], c2[3]),
+        _dimension_witness(c1[1], c2[1], c1[4], c2[4]),
+        _dimension_witness(c1[2], c2[2], c1[5], c2[5]),
+    )
+    if any(dimension is None for dimension in dimensions):
+        return None
+    if not _tag_constraints_compatible(r1, r2, c1[6], c2[6], c1[7], c2[7]):
         return None
 
     identical = (
         r1["subject"] == r2["subject"]
         and r1["action"] == r2["action"]
         and r1["resource"] == r2["resource"]
+        and r1["subject_exclude"] == r2["subject_exclude"]
+        and r1["action_exclude"] == r2["action_exclude"]
+        and r1["resource_exclude"] == r2["resource_exclude"]
         and r1["tags"] == r2["tags"]
         and r1["tag_patterns"] == r2["tag_patterns"]
         and r1["tag_exclude_patterns"] == r2["tag_exclude_patterns"]
@@ -812,7 +855,7 @@ def _audit_pair(r1, r2, c1, c2):
             "winner": winner["id"],
             "shadowed": loser["id"],
             "reason": reason,
-            "witness": _pair_witness(r1, r2, c1, c2),
+            "witness": _pair_witness(r1, r2, c1, c2, dimensions),
         }
 
     if r1["effect"] != r2["effect"]:
@@ -830,7 +873,7 @@ def _audit_pair(r1, r2, c1, c2):
                 "rule %r for every request matching both, regardless of "
                 "priority" % (deny["id"], allow["id"])
             ),
-            "witness": _pair_witness(r1, r2, c1, c2),
+            "witness": _pair_witness(r1, r2, c1, c2, dimensions),
         }
 
     # Same-effect partial overlap is not a conflict.
@@ -878,6 +921,13 @@ class PolicyGate:
                 if not isinstance(r.get(field, "*"), str):
                     raise ValueError(
                         "rule %d: field %r must be a string" % (i, field)
+                    )
+
+            for field in _EXCLUSION_FIELDS:
+                if field in r and not isinstance(r[field], str):
+                    raise ValueError(
+                        "invalid_selector_exclusion: rule %d: field %r "
+                        "must be a string" % (i, field)
                     )
 
             tags = r.get("tags", {})
@@ -975,6 +1025,9 @@ class PolicyGate:
                     "subject": r.get("subject", "*"),
                     "action": r.get("action", "*"),
                     "resource": r.get("resource", "*"),
+                    "subject_exclude": r.get("subject_exclude"),
+                    "action_exclude": r.get("action_exclude"),
+                    "resource_exclude": r.get("resource_exclude"),
                     "tags": tags,
                     "tag_patterns": tag_patterns,
                     "tag_exclude_patterns": tag_exclude_patterns,
@@ -1040,7 +1093,6 @@ class PolicyGate:
         "subject",
         "action",
         "resource",
-        "tags",
     )
 
     def _snapshot(self):
@@ -1049,7 +1101,12 @@ class PolicyGate:
         Only the effective fields are copied, in fixed order, so the
         internal ``_index`` never leaks; the copy is shallow, and only read
         by the serializer, so neither the rules nor caller-provided
-        mappings are mutated. ``tag_patterns`` is appended right after
+        mappings are mutated. Each provided ``subject_exclude``,
+        ``action_exclude`` and ``resource_exclude`` selector exclusion is
+        written in that fixed field order immediately after ``resource``
+        (an absent exclusion exports nothing, so rules that never use
+        selector exclusions keep their legacy byte-level snapshot),
+        followed by ``tags``. ``tag_patterns`` is appended right after
         ``tags`` only when non-empty, ``tag_exclude_patterns`` right
         after it under the same rule, and ``tag_presence`` last under
         the same rule, so rules that never use pattern or presence
@@ -1058,6 +1115,10 @@ class PolicyGate:
         snapshot = []
         for rule in self.rules:
             pairs = [(field, rule[field]) for field in self._SNAPSHOT_FIELDS]
+            for field in _EXCLUSION_FIELDS:
+                if rule[field] is not None:
+                    pairs.append((field, rule[field]))
+            pairs.append(("tags", rule["tags"]))
             if rule["tag_patterns"]:
                 pairs.append(("tag_patterns", rule["tag_patterns"]))
             if rule["tag_exclude_patterns"]:
@@ -1076,7 +1137,12 @@ class PolicyGate:
         rule writes its normalized, actually-effective ``id``, ``effect``,
         ``priority``, ``subject``, ``action``, ``resource`` and ``tags``
         in that fixed order, so all defaults appear explicitly and no
-        internal index leaks; a rule with a non-empty ``tag_patterns``
+        internal index leaks; each provided ``subject_exclude``,
+        ``action_exclude`` and ``resource_exclude`` selector exclusion is
+        written in that fixed field order immediately after ``resource``
+        and before ``tags``, while rules without selector exclusions
+        export exactly the same bytes as before; a rule with a non-empty
+        ``tag_patterns``
         mapping writes it in the same fixed order immediately after
         ``tags``, a rule with a non-empty ``tag_exclude_patterns``
         mapping writes it immediately after that, and a rule with a
@@ -1140,9 +1206,15 @@ class PolicyGate:
     @staticmethod
     def _matches(rule, subject, action, resource, tags):
         return (
-            fnmatch.fnmatchcase(subject, rule["subject"])
-            and fnmatch.fnmatchcase(action, rule["action"])
-            and fnmatch.fnmatchcase(resource, rule["resource"])
+            _dimension_matches(
+                subject, rule["subject"], rule["subject_exclude"]
+            )
+            and _dimension_matches(
+                action, rule["action"], rule["action_exclude"]
+            )
+            and _dimension_matches(
+                resource, rule["resource"], rule["resource_exclude"]
+            )
             and PolicyGate._tags_match(rule, tags)
         )
 
@@ -1620,7 +1692,12 @@ class PolicyGate:
         ``effect``, ``priority``, ``subject_match``, ``action_match``,
         ``resource_match``, ``tags_match``, ``matched``, ``selected``.
         The first three flags compare subject/action/resource against the
-        rule's glob patterns with ``fnmatch.fnmatchcase``; ``tags_match``
+        rule's glob patterns with ``fnmatch.fnmatchcase`` and, when the
+        rule declares the matching ``subject_exclude``/``action_exclude``/
+        ``resource_exclude`` selector exclusion, additionally require the
+        value not to hit that exclusion pattern (each flag is the
+        conjunction of the positive match and the exclusion check);
+        ``tags_match``
         is the conjunction of the rule's exact tag constraints, its
         ``tag_patterns`` pattern constraints and its
         ``tag_exclude_patterns`` exclusion constraints (``tags=None``
@@ -1643,9 +1720,15 @@ class PolicyGate:
         evaluations = []
         matched = []
         for r in self.rules:
-            subject_match = fnmatch.fnmatchcase(subject, r["subject"])
-            action_match = fnmatch.fnmatchcase(action, r["action"])
-            resource_match = fnmatch.fnmatchcase(resource, r["resource"])
+            subject_match = _dimension_matches(
+                subject, r["subject"], r["subject_exclude"]
+            )
+            action_match = _dimension_matches(
+                action, r["action"], r["action_exclude"]
+            )
+            resource_match = _dimension_matches(
+                resource, r["resource"], r["resource_exclude"]
+            )
             tags_match = PolicyGate._tags_match(r, tags)
             rule_matched = (
                 subject_match and action_match and resource_match and tags_match
@@ -1715,8 +1798,11 @@ class PolicyGate:
         decide()/explain()/decide_many() results are unaffected.
 
         Every pair of rules is checked in declaration order. Two
-        selectors overlap when some subject/action/resource string
-        matches both glob patterns under fnmatch.fnmatchcase semantics
+        selectors overlap when, in each of the subject/action/resource
+        dimensions, some string matches both rules' positive glob
+        patterns under fnmatch.fnmatchcase semantics while hitting
+        neither rule's ``subject_exclude``/``action_exclude``/
+        ``resource_exclude`` exclusion pattern in that dimension,
         and their tag constraints are jointly satisfiable (a shared tag
         key with different exact values conflicts; an exact value must
         match a shared key's ``tag_patterns`` pattern; two patterns on a
@@ -1731,7 +1817,8 @@ class PolicyGate:
         different effects yield one
         ``effect_overlap`` error finding whose winner is the deny rule —
         explicit deny overrides allow, and priority cannot change that.
-        Selectors with identical pattern texts, tags and exclusion
+        Selectors with identical pattern texts, identical exclusion
+        patterns, tags and tag exclusion
         patterns yield one
         ``shadowed_rule`` finding instead: an error when deny shadows
         allow, a warning when same-effect rules collide (the loser by
@@ -1754,10 +1841,13 @@ class PolicyGate:
         pair's exact and pattern tag constraints, so it reproduces the
         reported
         effect overlap or full shadowing. For each string field the
-        witness is the shortest string matching both rules' patterns,
+        witness is the shortest string matching both rules' positive
+        patterns and hitting neither rule's exclusion pattern in that
+        dimension,
         ties broken by Unicode code-point lexicographic order (the empty
         string is allowed), and the three fields are chosen
-        independently. ``tags`` merges both rules' constraints only:
+        independently; a pair whose exclusions leave no usable string
+        in any one dimension produces no finding at all. ``tags`` merges both rules' constraints only:
         shared keys already carry equal values for a reported pair, all
         non-conflicting keys are retained, keys are emitted in Unicode
         code-point order, and no other request tag is invented. A key
@@ -1782,6 +1872,15 @@ class PolicyGate:
                 _tokenize_pattern(r["subject"]),
                 _tokenize_pattern(r["action"]),
                 _tokenize_pattern(r["resource"]),
+                None
+                if r["subject_exclude"] is None
+                else _tokenize_pattern(r["subject_exclude"]),
+                None
+                if r["action_exclude"] is None
+                else _tokenize_pattern(r["action_exclude"]),
+                None
+                if r["resource_exclude"] is None
+                else _tokenize_pattern(r["resource_exclude"]),
                 {
                     key: _tokenize_pattern(pattern)
                     for key, pattern in r["tag_patterns"].items()

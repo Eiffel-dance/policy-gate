@@ -87,6 +87,15 @@ Tests: python3 -m unittest discover -s tests -v
 - `audit` 把排除模式纳入重叠、`shadowed_rule`、`effect_overlap` 和 witness 判断：只有存在同时满足双方正向约束且避开双方排除模式的标签值时才报告 finding。`witness.tags` 只包含两条规则声明过的键（含仅出现在 `tag_exclude_patterns` 中的键），按键的 Unicode 码点序输出；每个键取能重放 finding 的最短字符串，长度相同按 Unicode 码点字典序，某键无可选值时不生成该 finding。
 - `to_json` 在规则使用 `tag_exclude_patterns` 时按固定位置在 `tags`（及 `tag_patterns`）之后导出该字段，键递归按 Unicode 码点排序，`fingerprint` 随其变化；空映射不改变旧快照。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
 
+## 选择器排除约束
+
+规则可携带可选的 `subject_exclude`、`action_exclude`、`resource_exclude` 三个字段，声明对应维度的取值不得命中指定模式，从而表达"允许所有主体但排除临时账号"一类的反向约束；不改变既有规则和任何返回结构。
+
+- 字段未提供表示不排除；提供后必须是字符串，空字符串也按 `fnmatch.fnmatchcase` 真实语义处理（仅排除空字符串）。类型错误在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_selector_exclusion` 并带规则索引和字段名，不会延迟到 `decide`；未知字段、配置错误和异常优先级沿用既有定义。
+- 请求只有在正向选择器匹配且未命中该维度排除模式时才命中规则，三个维度合取；标签约束、显式 deny、priority、声明顺序和默认拒绝语义完全沿用。排除条件贯穿 `decide`、`explain`、`trace`、`decide_many`、`trace_many`、`verify`、`coverage`、`compare`，返回结构和选择口径不变，其中 `trace` 的 `subject_match`、`action_match`、`resource_match` 分别表示正向匹配与排除检查的合取。
+- `audit` 把排除模式纳入重叠、`shadowed_rule`、`effect_overlap` 与 witness 判断，并把三个排除字段纳入选择器相同性判断；现有 finding 字段和 deny 胜出语义不变。`witness` 的 `subject`、`action`、`resource` 分别取同时满足两条规则正向模式且避开双方排除模式的最短字符串，长度相同按 Unicode 码点字典序取小；任一维度无可满足字符串就不生成 finding。生成的 witness 交回 `decide` 或 `explain` 仍同时命中两条规则，重复审计稳定，修改返回报告不影响后续调用。
+- `to_json` 在规则使用排除字段时按 `subject_exclude`、`action_exclude`、`resource_exclude` 的固定顺序紧跟 `resource` 导出，`fingerprint` 随其变化；未使用新字段的规则，其判定、错误边界、审计结果以及 `to_json` 字节和 `fingerprint` 保持不变。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
+
 ## 标签键存在性约束
 
 规则可携带可选的 `tag_presence` 映射，声明某个标签键必须存在或必须不存在，从而区分“标签缺失”与“标签值不匹配”；不改变既有规则和任何返回结构。
