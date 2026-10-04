@@ -4131,5 +4131,276 @@ class SelectorExclusionTest(unittest.TestCase):
         self.assertIn(finding["other_rule"], matched_ids)
 
 
+class RuleChangeReportTest(unittest.TestCase):
+    def _gates(self):
+        baseline = PolicyGate(
+            [
+                {"id": "same", "effect": "allow", "priority": 1,
+                 "subject": "u*", "tags": {"z": 1, "a": "b"}},
+                {"id": "moved", "effect": "allow", "action": "read"},
+                {"id": "gone", "effect": "deny", "resource": "secret/*"},
+                {"id": "mod", "effect": "allow", "priority": 5,
+                 "tag_presence": {"env": True}},
+                {"id": "reorder", "effect": "allow"},
+            ]
+        )
+        candidate = PolicyGate(
+            [
+                {"id": "same", "effect": "allow", "priority": 1,
+                 "subject": "u*", "tags": {"a": "b", "z": 1}},
+                {"id": "new1", "effect": "deny"},
+                {"id": "reorder", "effect": "allow"},
+                {"id": "moved", "effect": "allow", "action": "read"},
+                {"id": "mod", "effect": "deny", "priority": 5,
+                 "tag_presence": {"env": True},
+                 "subject_exclude": "x*", "tags": {"k": "v"}},
+            ]
+        )
+        return baseline, candidate
+
+    def test_report_shape_and_ordering(self):
+        baseline, candidate = self._gates()
+        report = baseline.rule_change_report(candidate)
+        self.assertEqual(
+            list(report), ["added", "removed", "changed", "unchanged",
+                           "summary"]
+        )
+        self.assertEqual([r["id"] for r in report["added"]], ["new1"])
+        self.assertEqual([r["id"] for r in report["removed"]], ["gone"])
+        self.assertEqual(report["unchanged"], ["same"])
+        self.assertEqual(
+            [c["id"] for c in report["changed"]],
+            ["moved", "mod", "reorder"],
+        )
+        self.assertEqual(
+            report["summary"],
+            {"baseline_total": 5, "candidate_total": 5,
+             "added": 1, "removed": 1, "changed": 3, "unchanged": 1},
+        )
+
+    def test_changed_entry_shape_and_fields(self):
+        baseline, candidate = self._gates()
+        report = baseline.rule_change_report(candidate)
+        by_id = {c["id"]: c for c in report["changed"]}
+
+        moved = by_id["moved"]
+        self.assertEqual(
+            list(moved),
+            ["id", "before", "after", "fields",
+             "before_index", "after_index"],
+        )
+        self.assertEqual(moved["fields"], ["declaration_order"])
+        self.assertEqual((moved["before_index"], moved["after_index"]),
+                         (1, 3))
+        self.assertEqual(moved["before"], moved["after"])
+
+        reorder = by_id["reorder"]
+        self.assertEqual(reorder["fields"], ["declaration_order"])
+        self.assertEqual((reorder["before_index"], reorder["after_index"]),
+                         (4, 2))
+
+        mod = by_id["mod"]
+        self.assertEqual(
+            mod["fields"],
+            ["effect", "subject_exclude", "tags", "declaration_order"],
+        )
+        self.assertEqual((mod["before_index"], mod["after_index"]), (3, 4))
+        self.assertNotIn("subject_exclude", mod["before"])
+        self.assertEqual(mod["after"]["subject_exclude"], "x*")
+
+    def test_declaration_order_only_still_changed(self):
+        baseline = PolicyGate(
+            [{"id": "a", "effect": "allow"},
+             {"id": "b", "effect": "allow"}]
+        )
+        candidate = PolicyGate(
+            [{"id": "b", "effect": "allow"},
+             {"id": "a", "effect": "allow"}]
+        )
+        report = baseline.rule_change_report(candidate)
+        self.assertEqual(report["unchanged"], [])
+        self.assertEqual([c["id"] for c in report["changed"]], ["a", "b"])
+        self.assertTrue(
+            all(c["fields"] == ["declaration_order"]
+                for c in report["changed"])
+        )
+        self.assertEqual(report["summary"]["changed"], 2)
+
+    def test_snapshots_match_to_json_elements(self):
+        import json
+
+        baseline, candidate = self._gates()
+        report = baseline.rule_change_report(candidate)
+        base_json = {r["id"]: r for r in json.loads(baseline.to_json())}
+        cand_json = {r["id"]: r for r in json.loads(candidate.to_json())}
+        self.assertEqual(report["removed"][0], base_json["gone"])
+        self.assertEqual(report["added"][0], cand_json["new1"])
+        by_id = {c["id"]: c for c in report["changed"]}
+        self.assertEqual(by_id["mod"]["before"], base_json["mod"])
+        self.assertEqual(by_id["mod"]["after"], cand_json["mod"])
+        # rule-level key order follows to_json exactly
+        self.assertEqual(
+            list(report["added"][0]),
+            ["id", "effect", "priority", "subject", "action", "resource",
+             "tags"],
+        )
+        self.assertEqual(
+            list(by_id["mod"]["after"]),
+            ["id", "effect", "priority", "subject", "action", "resource",
+             "subject_exclude", "tags", "tag_presence"],
+        )
+        # nested tag keys are Unicode-sorted and _index never leaks
+        tagged = PolicyGate([{"id": "t", "effect": "allow",
+                              "tags": {"z": 1, "a": 2}}])
+        other = PolicyGate([{"id": "t", "effect": "deny",
+                             "tags": {"z": 1, "a": 2}}])
+        changed = tagged.rule_change_report(other)["changed"][0]
+        self.assertEqual(list(changed["before"]["tags"]), ["a", "z"])
+        self.assertNotIn('"_index":', json.dumps(report))
+
+    def test_field_order_in_changed_fields(self):
+        baseline = PolicyGate(
+            [{"id": "r", "effect": "allow", "priority": 1,
+              "subject": "a", "action": "a", "resource": "a",
+              "subject_exclude": "s*", "action_exclude": "s*",
+              "resource_exclude": "s*",
+              "tags": {"k": "1"}, "tag_patterns": {"p": "1*"},
+              "tag_exclude_patterns": {"e": "1*"},
+              "tag_presence": {"x": True}}]
+        )
+        candidate = PolicyGate(
+            [{"id": "r", "effect": "deny", "priority": 2,
+              "subject": "b", "action": "b", "resource": "b",
+              "subject_exclude": "t*", "action_exclude": "t*",
+              "resource_exclude": "t*",
+              "tags": {"k": "2"}, "tag_patterns": {"p": "2*"},
+              "tag_exclude_patterns": {"e": "2*"},
+              "tag_presence": {"x": False}}]
+        )
+        fields = baseline.rule_change_report(candidate)["changed"][0]["fields"]
+        self.assertEqual(
+            fields,
+            ["effect", "priority", "subject", "action", "resource",
+             "subject_exclude", "action_exclude", "resource_exclude",
+             "tags", "tag_patterns", "tag_exclude_patterns",
+             "tag_presence"],
+        )
+
+    def test_selector_exclusion_added_and_removed_classified(self):
+        baseline = PolicyGate(
+            [{"id": "r", "effect": "allow", "subject_exclude": "a*"}]
+        )
+        candidate = PolicyGate(
+            [{"id": "r", "effect": "allow", "action_exclude": "b*"}]
+        )
+        fields = baseline.rule_change_report(candidate)["changed"][0]["fields"]
+        self.assertEqual(fields, ["subject_exclude", "action_exclude"])
+
+    def test_tag_constraint_differences_classified(self):
+        baseline = PolicyGate(
+            [{"id": "r", "effect": "allow",
+              "tag_patterns": {"env": "dev*"},
+              "tag_exclude_patterns": {"x": "y*"}}]
+        )
+        candidate = PolicyGate(
+            [{"id": "r", "effect": "allow",
+              "tag_patterns": {"env": "prd*"},
+              "tag_exclude_patterns": {"x": "z*"}}]
+        )
+        fields = baseline.rule_change_report(candidate)["changed"][0]["fields"]
+        self.assertEqual(fields, ["tag_patterns",
+                                  "tag_exclude_patterns"])
+
+    def test_added_removed_follow_declaration_order(self):
+        baseline = PolicyGate(
+            [{"id": "b1", "effect": "allow"},
+             {"id": "b2", "effect": "allow"}]
+        )
+        candidate = PolicyGate(
+            [{"id": "c1", "effect": "allow"},
+             {"id": "c2", "effect": "allow"},
+             {"id": "c3", "effect": "allow"}]
+        )
+        report = baseline.rule_change_report(candidate)
+        self.assertEqual([r["id"] for r in report["added"]],
+                         ["c1", "c2", "c3"])
+        reverse = candidate.rule_change_report(baseline)
+        self.assertEqual([r["id"] for r in reverse["removed"]],
+                         ["c1", "c2", "c3"])
+        self.assertEqual([r["id"] for r in reverse["added"]],
+                         ["b1", "b2"])
+
+    def test_empty_gates(self):
+        empty = PolicyGate([])
+        report = empty.rule_change_report(empty)
+        self.assertEqual(
+            report,
+            {"added": [], "removed": [], "changed": [], "unchanged": [],
+             "summary": {"baseline_total": 0, "candidate_total": 0,
+                         "added": 0, "removed": 0, "changed": 0,
+                         "unchanged": 0}},
+        )
+
+    def test_candidate_type_error(self):
+        gate = PolicyGate([])
+        for bad in ([], {}, None, "gate", 1, object()):
+            with self.assertRaises(TypeError):
+                gate.rule_change_report(bad)
+
+    def test_non_json_value_raises_value_error(self):
+        gate = PolicyGate([{"id": "r", "effect": "allow"}])
+        weird = PolicyGate([{"id": "w", "effect": "allow",
+                             "tags": {"k": {1, 2}}}])
+        with self.assertRaises(ValueError) as ctx:
+            gate.rule_change_report(weird)
+        self.assertIn("non_json_value", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            weird.rule_change_report(gate)
+        self.assertIn("non_json_value", str(ctx.exception))
+
+        tuple_field = PolicyGate([{"id": "r", "effect": "allow"}])
+        tuple_field.rules[0]["priority"] = (1,)
+        with self.assertRaises(ValueError) as ctx:
+            gate.rule_change_report(tuple_field)
+        self.assertIn("non_json_value", str(ctx.exception))
+
+    def test_read_only_deterministic_and_isolated(self):
+        import json
+
+        baseline, candidate = self._gates()
+        before_json = baseline.to_json()
+        before_fp = baseline.fingerprint()
+        first = baseline.rule_change_report(candidate)
+        for _ in range(5):
+            self.assertEqual(
+                baseline.rule_change_report(candidate), first
+            )
+        first["changed"][0]["fields"].append("hacked")
+        first["added"][0]["tags"]["h"] = 1
+        fresh = baseline.rule_change_report(candidate)
+        self.assertNotIn("hacked", fresh["changed"][0]["fields"])
+        self.assertNotIn("h", fresh["added"][0]["tags"])
+        self.assertEqual(baseline.to_json(), before_json)
+        self.assertEqual(baseline.fingerprint(), before_fp)
+        # existing decisions are untouched
+        decision = baseline.decide(
+            "u1", "x", "r", {"a": "b", "z": 1}
+        )
+        self.assertEqual(decision["rule"], "same")
+        json.dumps(fresh)  # whole report is strict-JSON serializable
+
+    def test_unchanged_despite_input_key_insertion_order(self):
+        baseline = PolicyGate(
+            [{"id": "r", "effect": "allow", "tags": {"z": 1, "a": 2}}]
+        )
+        candidate = PolicyGate.from_json(
+            '[{"id":"r","effect":"allow","tags":{"a":2,"z":1}}]'
+        )
+        report = baseline.rule_change_report(candidate)
+        self.assertEqual(report["unchanged"], ["r"])
+        self.assertEqual(report["changed"], [])
+        self.assertEqual(report["summary"]["unchanged"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

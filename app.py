@@ -1088,40 +1088,65 @@ class PolicyGate:
         "resource",
     )
 
+    def _rule_snapshot_object(self, rule):
+        """One rule's normalized snapshot as a fixed-order ``_FixedObject``.
+
+        Only the effective fields are emitted, in fixed order, so the
+        internal ``_index`` never leaks; each provided selector
+        exclusion is emitted in its fixed order immediately after
+        ``resource`` (an omitted field, stored as ``None``, is never
+        written, while an explicitly provided empty string is), then
+        ``tags``, followed by non-empty ``tag_patterns``,
+        ``tag_exclude_patterns`` and ``tag_presence`` mappings in that
+        order. Shared by :meth:`_snapshot` and
+        :meth:`rule_change_report` so both views always agree.
+        """
+        pairs = [(field, rule[field]) for field in self._SNAPSHOT_FIELDS]
+        for field in _EXCLUSION_FIELDS:
+            if rule[field] is not None:
+                pairs.append((field, rule[field]))
+        pairs.append(("tags", rule["tags"]))
+        if rule["tag_patterns"]:
+            pairs.append(("tag_patterns", rule["tag_patterns"]))
+        if rule["tag_exclude_patterns"]:
+            pairs.append(("tag_exclude_patterns", rule["tag_exclude_patterns"]))
+        if rule["tag_presence"]:
+            pairs.append(("tag_presence", rule["tag_presence"]))
+        return _FixedObject(pairs)
+
+    @staticmethod
+    def _materialize_snapshot(value):
+        """Convert canonical snapshot structures into plain JSON values.
+
+        ``_FixedObject`` keeps its declared pair order; plain mappings
+        are rebuilt with their string keys in Unicode code-point order,
+        exactly mirroring :func:`_canonical_json`'s nested-key sorting;
+        lists keep their element order. Every container is rebuilt
+        recursively, so a materialized report shares no mutable container
+        with the loaded rules. Leaves are strict-JSON scalars (the
+        snapshot has already been through :func:`_canonical_json`).
+        """
+        if isinstance(value, _FixedObject):
+            return {
+                key: PolicyGate._materialize_snapshot(val)
+                for key, val in value.pairs
+            }
+        if isinstance(value, Mapping):
+            return {
+                key: PolicyGate._materialize_snapshot(value[key])
+                for key in sorted(value.keys())
+            }
+        if isinstance(value, list):
+            return [PolicyGate._materialize_snapshot(val) for val in value]
+        return value
+
     def _snapshot(self):
         """Normalized rules ready for canonical JSON serialization.
 
-        Only the effective fields are copied, in fixed order, so the
-        internal ``_index`` never leaks; the copy is shallow, and only read
-        by the serializer, so neither the rules nor caller-provided
-        mappings are mutated. Each provided selector exclusion
-        (``subject_exclude``, ``action_exclude``, ``resource_exclude``)
-        is emitted in that fixed field order immediately after
-        ``resource`` — an omitted field (stored as ``None``) is never
-        written, while an explicitly provided empty string is — then
-        ``tags`` follows. ``tag_patterns`` is appended right after
-        ``tags`` only when non-empty, ``tag_exclude_patterns`` right
-        after it under the same rule, and ``tag_presence`` last under
-        the same rule, so rules that never use exclusion, pattern or
-        presence constraints keep their legacy byte-level snapshot.
+        The copy is shallow, and only read by the serializer, so neither
+        the rules nor caller-provided mappings are mutated.
         """
-        snapshot = []
-        for rule in self.rules:
-            pairs = [(field, rule[field]) for field in self._SNAPSHOT_FIELDS]
-            for field in _EXCLUSION_FIELDS:
-                if rule[field] is not None:
-                    pairs.append((field, rule[field]))
-            pairs.append(("tags", rule["tags"]))
-            if rule["tag_patterns"]:
-                pairs.append(("tag_patterns", rule["tag_patterns"]))
-            if rule["tag_exclude_patterns"]:
-                pairs.append(
-                    ("tag_exclude_patterns", rule["tag_exclude_patterns"])
-                )
-            if rule["tag_presence"]:
-                pairs.append(("tag_presence", rule["tag_presence"]))
-            snapshot.append(_FixedObject(pairs))
-        return snapshot
+        return [self._rule_snapshot_object(rule) for rule in self.rules]
 
     def to_json(self):
         """Export the loaded rules as canonical strict-JSON text.
@@ -1669,6 +1694,157 @@ class PolicyGate:
             "winner_changed": winner_changed,
         }
         return {"changes": changes, "summary": summary}
+
+    def rule_change_report(self, candidate):
+        """Align this gate's rules against ``candidate``'s by rule id.
+
+        Release-review report over two *loaded* configurations: this gate
+        is the baseline and ``candidate`` must be another validated
+        :class:`PolicyGate`, otherwise ``TypeError`` is raised. No
+        requests are evaluated; decide/explain/audit/compare/to_json/
+        fingerprint behavior is untouched.
+
+        Returns ``{"added": [...], "removed": [...], "changed": [...],
+        "unchanged": [...], "summary": {...}}``:
+
+        * ``added`` lists rules present only in the candidate, in
+          candidate declaration order; ``removed`` lists rules present
+          only in the baseline, in baseline declaration order. Both use
+          the same normalized, ``_index``-free rule snapshots as
+          :meth:`to_json` — the same fields, fixed rule-level order and
+          Unicode-sorted nested tag keys (empty optional mappings are
+          omitted exactly as in the JSON text).
+        * ``unchanged`` lists, in baseline declaration order, the ids
+          whose rule is configured identically on both sides.
+        * ``changed`` lists, in baseline declaration order, one entry per
+          shared id whose configuration differs, as
+          ``{"id", "before", "after", "fields", "before_index",
+          "after_index"}``: ``before``/``after`` are the baseline/
+          candidate rule snapshots, ``before_index``/``after_index``
+          their declaration positions, and ``fields`` names the changed
+          fields in the fixed order
+          ``effect``, ``priority``, ``subject``, ``action``,
+          ``resource``, ``subject_exclude``, ``action_exclude``,
+          ``resource_exclude``, ``tags``, ``tag_patterns``,
+          ``tag_exclude_patterns``, ``tag_presence``, plus
+          ``declaration_order`` when only (or also) the rule's position
+          moved. A rule repositioned without any other change is
+          therefore still reported as changed with
+          ``fields == ["declaration_order"]``. Selector-exclusion
+          differences compare the normalized field (``None`` when
+          omitted), and tag constraints compare their normalized
+          mappings.
+
+        ``summary`` holds the fixed keys ``baseline_total``,
+        ``candidate_total``, ``added``, ``removed``, ``changed`` and
+        ``unchanged``, with the last four counting the equally named
+        arrays.
+
+        The report is read-only and offline: neither gate nor its rules
+        is modified, no I/O happens, repeated calls return equal
+        results, and mutating a returned report never affects later
+        calls. Snapshot values that cannot be represented under the
+        existing strict-JSON semantics (as with direct construction
+        followed by :meth:`to_json`) raise ``ValueError`` tagged
+        ``non_json_value`` instead of a partial report.
+        """
+        if not isinstance(candidate, PolicyGate):
+            raise TypeError("candidate must be a PolicyGate instance")
+
+        baseline_rules = self.rules
+        candidate_rules = candidate.rules
+        candidate_by_id = {rule["id"]: rule for rule in candidate_rules}
+
+        # Build every snapshot and run the whole report through strict
+        # canonical-JSON validation before anything is returned, so an
+        # unrepresentable value aborts with non_json_value and leaves no
+        # partial report behind.
+        baseline_snapshots = {
+            rule["id"]: self._rule_snapshot_object(rule)
+            for rule in baseline_rules
+        }
+        candidate_snapshots = {
+            rule["id"]: self._rule_snapshot_object(rule)
+            for rule in candidate_rules
+        }
+        _canonical_json(
+            [baseline_snapshots[rule["id"]] for rule in baseline_rules]
+            + [candidate_snapshots[rule["id"]] for rule in candidate_rules]
+        )
+
+        added = [
+            self._materialize_snapshot(candidate_snapshots[rule["id"]])
+            for rule in candidate_rules
+            if rule["id"] not in baseline_snapshots
+        ]
+        removed = [
+            self._materialize_snapshot(baseline_snapshots[rule["id"]])
+            for rule in baseline_rules
+            if rule["id"] not in candidate_snapshots
+        ]
+        unchanged = []
+        changed = []
+        compare_fields = (
+            ("effect", "effect"),
+            ("priority", "priority"),
+            ("subject", "subject"),
+            ("action", "action"),
+            ("resource", "resource"),
+            ("subject_exclude", "subject_exclude"),
+            ("action_exclude", "action_exclude"),
+            ("resource_exclude", "resource_exclude"),
+            ("tags", "tags"),
+            ("tag_patterns", "tag_patterns"),
+            ("tag_exclude_patterns", "tag_exclude_patterns"),
+            ("tag_presence", "tag_presence"),
+        )
+        for before_rule in baseline_rules:
+            rid = before_rule["id"]
+            after_rule = candidate_by_id.get(rid)
+            if after_rule is None:
+                continue
+            fields = [
+                name
+                for name, key in compare_fields
+                if before_rule[key] != after_rule[key]
+            ]
+            before_index = before_rule["_index"]
+            after_index = after_rule["_index"]
+            if before_index != after_index:
+                fields.append("declaration_order")
+            if not fields:
+                unchanged.append(rid)
+                continue
+            changed.append(
+                {
+                    "id": rid,
+                    "before": self._materialize_snapshot(
+                        baseline_snapshots[rid]
+                    ),
+                    "after": self._materialize_snapshot(
+                        candidate_snapshots[rid]
+                    ),
+                    "fields": fields,
+                    "before_index": before_index,
+                    "after_index": after_index,
+                }
+            )
+
+        summary = {
+            "baseline_total": len(baseline_rules),
+            "candidate_total": len(candidate_rules),
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": len(unchanged),
+        }
+        return {
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "unchanged": unchanged,
+            "summary": summary,
+        }
 
     def explain(self, subject, action, resource, tags=None):
         """Read-only offline view of one decision and its full evidence.
