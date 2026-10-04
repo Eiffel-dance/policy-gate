@@ -3,6 +3,7 @@ import fnmatch
 import hashlib
 import json
 import math
+from collections import deque
 from collections.abc import Mapping
 
 _ALLOWED_FIELDS = frozenset(
@@ -15,6 +16,7 @@ _ALLOWED_FIELDS = frozenset(
         "resource",
         "tags",
         "tag_patterns",
+        "tag_exclude_patterns",
     }
 )
 _STRING_FIELDS = ("subject", "action", "resource")
@@ -460,22 +462,127 @@ def _min_pattern_string(tokens):
     return "".join(chars)
 
 
+def _min_string_avoiding(positives, negatives):
+    """Shortest string matching every tokenized pattern in ``positives``
+    and no tokenized pattern in ``negatives``; ties broken by Unicode
+    code-point lexicographic order. Returns None when no string qualifies.
+
+    Each token list is simulated as the NFA fnmatch.translate implies:
+    states are token positions, a ``*`` has an epsilon move to the next
+    position and consumes any character while staying put, a char token
+    consumes one character in its positive ranges. The search is a BFS
+    over the product of per-pattern reachable state sets; characters are
+    enumerated by elementary code-point intervals (every character in one
+    interval triggers the same transition, so the interval's smallest
+    character represents it) in increasing order, which makes the first
+    accepting joint state discovered the (length, lexicographic) minimum.
+    A joint state accepts when every positive pattern has consumed all
+    its tokens and no negative pattern has.
+    """
+    nfas = []
+    for tokens in positives:
+        nfas.append((tokens, True))
+    for tokens in negatives:
+        nfas.append((tokens, False))
+    compiled = []
+    for tokens, _is_positive in nfas:
+        stars = 0
+        chars = []
+        for i, token in enumerate(tokens):
+            if token[0] == "star":
+                stars |= 1 << i
+            else:
+                chars.append((i, _positive_ranges(token)))
+        compiled.append((len(tokens), stars, tuple(chars)))
+
+    def closure(kind, state):
+        _n, stars, _chars = compiled[kind]
+        while True:
+            nxt = state | ((state & stars) << 1)
+            if nxt == state:
+                return state
+            state = nxt
+
+    start = tuple(closure(kind, 1) for kind in range(len(compiled)))
+
+    def accepting(joint):
+        for kind, (_tokens, is_positive) in enumerate(nfas):
+            done = (joint[kind] >> compiled[kind][0]) & 1
+            if is_positive:
+                if not done:
+                    return False
+            elif done:
+                return False
+        return True
+
+    visited = {start}
+    queue = deque([(start, "")])
+    while queue:
+        joint, text = queue.popleft()
+        if accepting(joint):
+            return text
+        boundaries = {0}
+        for kind in range(len(compiled)):
+            _n, _stars, chars = compiled[kind]
+            for i, ranges in chars:
+                if (joint[kind] >> i) & 1:
+                    for lo, hi in ranges:
+                        boundaries.add(lo)
+                        boundaries.add(min(hi + 1, 0x110000))
+        ordered = sorted(boundaries)
+        representatives = []
+        for pos, lo in enumerate(ordered):
+            hi = ordered[pos + 1] - 1 if pos + 1 < len(ordered) else 0x10FFFF
+            if lo <= min(hi, 0x10FFFF):
+                representatives.append(lo)
+        for codepoint in representatives:
+            nxt = []
+            for kind in range(len(compiled)):
+                _n, stars, chars = compiled[kind]
+                state = joint[kind]
+                stepped = state & stars  # a '*' consumes the char and stays
+                for i, ranges in chars:
+                    if (state >> i) & 1 and _ranges_contain(ranges, codepoint):
+                        stepped |= 1 << (i + 1)
+                nxt.append(closure(kind, stepped))
+            nxt = tuple(nxt)
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, text + chr(codepoint)))
+    return None
+
+
+def _ranges_contain(ranges, codepoint):
+    for lo, hi in ranges:
+        if lo <= codepoint <= hi:
+            return True
+        if codepoint < lo:
+            return False
+    return False
+
+
 def _value_matches_pattern(value, pattern):
     # A pattern constraint only matches string tag values; anything else
     # (including a missing key, surfaced as a non-string here) fails.
     return isinstance(value, str) and fnmatch.fnmatchcase(value, pattern)
 
 
-def _tag_constraints_compatible(r1, r2, tp1, tp2):
+def _tag_constraints_compatible(r1, r2, tp1, tp2, te1, te2):
     """True iff one tag assignment can satisfy both rules' constraints.
 
     ``tp1``/``tp2`` are the rules' ``tag_patterns`` values compiled by
-    :func:`_tokenize_pattern`. Constraints on disjoint keys are jointly
+    :func:`_tokenize_pattern`; ``te1``/``te2`` are their compiled
+    ``tag_exclude_patterns``. Constraints on disjoint keys are jointly
     satisfiable (the caller may supply extra tags). On a shared key, two
     exact values conflict only when unequal, an exact value must match
     the pattern, and two patterns need one common string. A pattern
     matching no string at all makes its own rule unsatisfiable, so no
-    request can match both rules.
+    request can match both rules. Exclusion constraints further require
+    the key's value to avoid every ``tag_exclude_patterns`` pattern
+    declared for it by either rule: an exact value fails when it is a
+    string hitting an exclusion pattern, and a pattern- or
+    exclusion-only key needs one string that satisfies its positive
+    patterns (if any) while matching none of the exclusion patterns.
     """
     tags1, pats1 = r1["tags"], r1["tag_patterns"]
     tags2, pats2 = r2["tags"], r2["tag_patterns"]
@@ -497,41 +604,73 @@ def _tag_constraints_compatible(r1, r2, tp1, tp2):
     for key in pats1:
         if key in pats2 and not _patterns_overlap(tp1[key], tp2[key]):
             return False
+    for key in set(te1) | set(te2):
+        if key in tags1 or key in tags2:
+            value = tags1[key] if key in tags1 else tags2[key]
+            for rule in (r1, r2):
+                pattern = rule["tag_exclude_patterns"].get(key)
+                if pattern is not None and _value_matches_pattern(
+                    value, pattern
+                ):
+                    return False
+        else:
+            positives = []
+            if key in pats1:
+                positives.append(tp1[key])
+            if key in pats2:
+                positives.append(tp2[key])
+            negatives = []
+            if key in te1:
+                negatives.append(te1[key])
+            if key in te2:
+                negatives.append(te2[key])
+            if _min_string_avoiding(positives, negatives) is None:
+                return False
     return True
 
 
-def _witness_tags(r1, r2, tp1, tp2):
+def _witness_tags(r1, r2, tp1, tp2, te1, te2):
     """Joint tag assignment satisfying both rules' tag constraints.
 
-    Only keys constrained by one of the two rules appear, emitted in
+    Only keys constrained by one of the two rules appear — whether in
+    ``tags``, ``tag_patterns`` or ``tag_exclude_patterns`` — emitted in
     Unicode code-point order. An exact constraint pins the value (a
     shared exact/pattern key takes the exact value, which the
-    compatibility check has already proven to match); a key constrained
-    only by patterns takes the shortest string satisfying every pattern
-    on it, ties broken by Unicode code-point lexicographic order. Exact
-    values are deep-copied (direct construction permits mutable tag
-    values) so a caller mutating a returned report can never touch the
-    loaded rules or later reports.
+    compatibility check has already proven to match every positive
+    pattern and avoid every exclusion); a key constrained only by
+    patterns and exclusions takes the shortest string satisfying every
+    positive pattern on it and matching none of its exclusion patterns,
+    ties broken by Unicode code-point lexicographic order. Exact values
+    are deep-copied (direct construction permits mutable tag values) so
+    a caller mutating a returned report can never touch the loaded rules
+    or later reports.
     """
     keys = (
         set(r1["tags"])
         | set(r1["tag_patterns"])
+        | set(r1["tag_exclude_patterns"])
         | set(r2["tags"])
         | set(r2["tag_patterns"])
+        | set(r2["tag_exclude_patterns"])
     )
     merged = {}
     for key in keys:
         exact = None
         have_exact = False
         patterns = []
-        for rule, compiled in ((r1, tp1), (r2, tp2)):
+        negatives = []
+        for rule, compiled, excluded in ((r1, tp1, te1), (r2, tp2, te2)):
             if key in rule["tags"]:
                 have_exact = True
                 exact = rule["tags"][key]
             elif key in rule["tag_patterns"]:
                 patterns.append(compiled[key])
+            if key in rule["tag_exclude_patterns"]:
+                negatives.append(excluded[key])
         if have_exact:
             merged[key] = copy.deepcopy(exact)
+        elif negatives:
+            merged[key] = _min_string_avoiding(patterns, negatives)
         elif len(patterns) == 1:
             merged[key] = _min_pattern_string(patterns[0])
         else:
@@ -545,7 +684,7 @@ def _pair_witness(r1, r2, c1, c2):
         "subject": _min_common_string(c1[0], c2[0]),
         "action": _min_common_string(c1[1], c2[1]),
         "resource": _min_common_string(c1[2], c2[2]),
-        "tags": _witness_tags(r1, r2, c1[3], c2[3]),
+        "tags": _witness_tags(r1, r2, c1[3], c2[3], c1[4], c2[4]),
     }
 
 
@@ -590,7 +729,7 @@ def _audit_pair(r1, r2, c1, c2):
         _patterns_overlap(c1[0], c2[0])
         and _patterns_overlap(c1[1], c2[1])
         and _patterns_overlap(c1[2], c2[2])
-        and _tag_constraints_compatible(r1, r2, c1[3], c2[3])
+        and _tag_constraints_compatible(r1, r2, c1[3], c2[3], c1[4], c2[4])
     ):
         return None
 
@@ -600,6 +739,7 @@ def _audit_pair(r1, r2, c1, c2):
         and r1["resource"] == r2["resource"]
         and r1["tags"] == r2["tags"]
         and r1["tag_patterns"] == r2["tag_patterns"]
+        and r1["tag_exclude_patterns"] == r2["tag_exclude_patterns"]
     )
     if identical:
         # Identical selectors: one rule can never win, so it is shadowed.
@@ -726,6 +866,31 @@ class PolicyGate:
                     "both 'tags' and 'tag_patterns'" % (i, shared_tag_keys[0])
                 )
 
+            tag_exclude_patterns = r.get("tag_exclude_patterns", {})
+            if (
+                not isinstance(tag_exclude_patterns, dict)
+                or not all(isinstance(k, str) for k in tag_exclude_patterns)
+                or not all(
+                    isinstance(v, str) for v in tag_exclude_patterns.values()
+                )
+            ):
+                raise ValueError(
+                    "invalid_tag_exclude_patterns: rule %d: field "
+                    "'tag_exclude_patterns' must be a mapping with string "
+                    "keys and string pattern values" % i
+                )
+
+            shared_exclude_keys = sorted(
+                (set(tags) | set(tag_patterns)) & set(tag_exclude_patterns)
+            )
+            if shared_exclude_keys:
+                key = shared_exclude_keys[0]
+                other = "tags" if key in tags else "tag_patterns"
+                raise ValueError(
+                    "tag_constraint_conflict: rule %d: key %r appears in "
+                    "both %r and 'tag_exclude_patterns'" % (i, key, other)
+                )
+
             unsupported = set(r) - _ALLOWED_FIELDS
             if unsupported:
                 raise ValueError(
@@ -742,6 +907,7 @@ class PolicyGate:
                     "resource": r.get("resource", "*"),
                     "tags": tags,
                     "tag_patterns": tag_patterns,
+                    "tag_exclude_patterns": tag_exclude_patterns,
                     "_index": i,
                 }
             )
@@ -813,7 +979,8 @@ class PolicyGate:
         internal ``_index`` never leaks; the copy is shallow, and only read
         by the serializer, so neither the rules nor caller-provided
         mappings are mutated. ``tag_patterns`` is appended right after
-        ``tags`` only when non-empty, so rules that never use pattern
+        ``tags`` only when non-empty, and ``tag_exclude_patterns`` right
+        after it under the same rule, so rules that never use pattern
         constraints keep their legacy byte-level snapshot.
         """
         snapshot = []
@@ -821,6 +988,10 @@ class PolicyGate:
             pairs = [(field, rule[field]) for field in self._SNAPSHOT_FIELDS]
             if rule["tag_patterns"]:
                 pairs.append(("tag_patterns", rule["tag_patterns"]))
+            if rule["tag_exclude_patterns"]:
+                pairs.append(
+                    ("tag_exclude_patterns", rule["tag_exclude_patterns"])
+                )
             snapshot.append(_FixedObject(pairs))
         return snapshot
 
@@ -833,8 +1004,9 @@ class PolicyGate:
         in that fixed order, so all defaults appear explicitly and no
         internal index leaks; a rule with a non-empty ``tag_patterns``
         mapping writes it in the same fixed order immediately after
-        ``tags``, while rules without pattern constraints export exactly
-        the same bytes as before. Tag objects (at every nesting level)
+        ``tags``, and a rule with a non-empty ``tag_exclude_patterns``
+        mapping writes it immediately after that, while rules without
+        pattern constraints export exactly the same bytes as before. Tag objects (at every nesting level)
         have their keys sorted by Unicode code point; separators are
         compact and non-ASCII characters are emitted unescaped. An empty
         rule set exports as ``[]`` and repeated calls return identical
@@ -866,10 +1038,20 @@ class PolicyGate:
         # Exact constraints compare values for equality; pattern
         # constraints apply fnmatch.fnmatchcase to the request's tag
         # value, so a missing key or a non-string value simply means the
-        # rule does not match.
-        return all(tags.get(k) == v for k, v in rule["tags"].items()) and all(
-            _value_matches_pattern(tags.get(k), pattern)
-            for k, pattern in rule["tag_patterns"].items()
+        # rule does not match. Exclusion constraints invert the pattern
+        # test: a missing key, a non-string value or a value that does
+        # not match the exclusion pattern all pass, and only an actual
+        # hit makes the rule not match.
+        return (
+            all(tags.get(k) == v for k, v in rule["tags"].items())
+            and all(
+                _value_matches_pattern(tags.get(k), pattern)
+                for k, pattern in rule["tag_patterns"].items()
+            )
+            and all(
+                not _value_matches_pattern(tags.get(k), pattern)
+                for k, pattern in rule["tag_exclude_patterns"].items()
+            )
         )
 
     @staticmethod
@@ -1120,9 +1302,9 @@ class PolicyGate:
         ``invalid_expectation`` for an illegal ``expected`` value.
 
         After validation, cases are evaluated in input order using the
-        existing :meth:`decide` semantics (glob matching, exact and
-        pattern tag constraints, explicit deny, priority, declaration
-        order and
+        existing :meth:`decide` semantics (glob matching, exact, pattern
+        and exclusion tag constraints, explicit deny, priority,
+        declaration order and
         default deny). A case passes only when both ``effect`` and
         ``rule`` equal the actual decision; ``reason`` never participates.
 
@@ -1185,9 +1367,9 @@ class PolicyGate:
         every loaded rule in declaration order as ``{"id", "effect",
         "matched", "winner"}``: ``matched`` counts the requests whose
         subject/action/resource matched the rule's glob patterns under
-        ``fnmatch.fnmatchcase`` semantics together with its exact and
-        pattern tag constraints, and ``winner`` counts the requests the
-        rule
+        ``fnmatch.fnmatchcase`` semantics together with its exact,
+        pattern and exclusion tag constraints, and ``winner`` counts the
+        requests the rule
         actually decided after explicit-deny precedence, priority and
         declaration-order tie-breaking. A request matching several rules
         raises every matched rule's ``matched`` but only the final
@@ -1356,10 +1538,13 @@ class PolicyGate:
         ``resource_match``, ``tags_match``, ``matched``, ``selected``.
         The first three flags compare subject/action/resource against the
         rule's glob patterns with ``fnmatch.fnmatchcase``; ``tags_match``
-        is the conjunction of the rule's exact tag constraints and its
-        ``tag_patterns`` pattern constraints (``tags=None`` counts as
-        an empty mapping, and a missing key or non-string value fails a
-        pattern constraint). ``matched`` is the conjunction of the four
+        is the conjunction of the rule's exact tag constraints, its
+        ``tag_patterns`` pattern constraints and its
+        ``tag_exclude_patterns`` exclusion constraints (``tags=None``
+        counts as an empty mapping; a missing key or non-string value
+        fails a positive pattern constraint but passes an exclusion,
+        and only a value actually matching an exclusion pattern fails
+        it). ``matched`` is the conjunction of the four
         flags; ``selected`` is true only on the final winning rule, and
         false everywhere when the request falls through to the default
         deny (``rule`` is then ``None``).
@@ -1450,10 +1635,15 @@ class PolicyGate:
         key with different exact values conflicts; an exact value must
         match a shared key's ``tag_patterns`` pattern; two patterns on a
         shared key need one common string; extra caller tags do not
-        matter). Overlapping selectors with different effects yield one
+        matter) and, for every key constrained by either rule, some tag
+        value satisfies both sides' positive constraints while matching
+        none of their ``tag_exclude_patterns`` exclusion patterns (an
+        exact value must avoid them too). Overlapping selectors with
+        different effects yield one
         ``effect_overlap`` error finding whose winner is the deny rule —
         explicit deny overrides allow, and priority cannot change that.
-        Selectors with identical pattern texts and tags yield one
+        Selectors with identical pattern texts, tags and exclusion
+        patterns yield one
         ``shadowed_rule`` finding instead: an error when deny shadows
         allow, a warning when same-effect rules collide (the loser by
         priority, then declaration order, is shadowed). Same-effect
@@ -1483,9 +1673,13 @@ class PolicyGate:
         non-conflicting keys are retained, keys are emitted in Unicode
         code-point order, and no other request tag is invented. A key
         constrained only by ``tag_patterns`` patterns takes the shortest
-        string satisfying every pattern on it (ties broken by Unicode
-        code-point lexicographic order); a key with an exact constraint
-        keeps that exact value. Rules
+        string satisfying every positive pattern on it and matching none
+        of the pair's ``tag_exclude_patterns`` patterns (ties broken by
+        Unicode code-point lexicographic order); a key declared only in
+        ``tag_exclude_patterns`` takes the shortest string avoiding
+        every exclusion on it, and a pair whose exclusions leave no
+        usable value for some declared key produces no finding at all;
+        a key with an exact constraint keeps that exact value. Rules
         built directly and via from_json produce identical witnesses,
         repeated calls return equal results, and mutating a returned
         report never affects later calls.
@@ -1498,6 +1692,10 @@ class PolicyGate:
                 {
                     key: _tokenize_pattern(pattern)
                     for key, pattern in r["tag_patterns"].items()
+                },
+                {
+                    key: _tokenize_pattern(pattern)
+                    for key, pattern in r["tag_exclude_patterns"].items()
                 },
             )
             for r in self.rules

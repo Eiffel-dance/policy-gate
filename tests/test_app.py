@@ -2710,5 +2710,523 @@ class TagPatternsTest(unittest.TestCase):
             self.assertEqual(loaded.trace(*args), gate.trace(*args))
 
 
+class TagExcludePatternsTest(unittest.TestCase):
+    def test_exclusion_hit_and_miss(self):
+        gate = PolicyGate(
+            [
+                {
+                    "id": "p",
+                    "effect": "allow",
+                    "tags": {"env": "prod"},
+                    "tag_exclude_patterns": {"stage": "tmp-*"},
+                }
+            ]
+        )
+        self.assertEqual(
+            gate.decide("s", "a", "r", {"env": "prod"})["rule"], "p"
+        )
+        self.assertEqual(
+            gate.decide("s", "a", "r",
+                        {"env": "prod", "stage": "stable"})["rule"],
+            "p",
+        )
+        self.assertIsNone(
+            gate.decide("s", "a", "r",
+                        {"env": "prod", "stage": "tmp-1"})["rule"]
+        )
+        # fnmatchcase semantics: case sensitive
+        self.assertEqual(
+            gate.decide("s", "a", "r",
+                        {"env": "prod", "stage": "TMP-1"})["rule"],
+            "p",
+        )
+
+    def test_missing_key_and_non_string_value_pass(self):
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_exclude_patterns": {"stage": "tmp-*"}}]
+        )
+        self.assertEqual(gate.decide("s", "a", "r")["rule"], "p")
+        self.assertEqual(gate.decide("s", "a", "r", None)["rule"], "p")
+        for value in (None, 1, True, ["tmp-1"], {"x": "y"}):
+            self.assertEqual(
+                gate.decide("s", "a", "r", {"stage": value})["rule"],
+                "p",
+                "value %r" % (value,),
+            )
+        self.assertIsNone(
+            gate.decide("s", "a", "r", {"stage": "tmp-"})["rule"]
+        )
+
+    def test_conjunction_with_exact_and_pattern_tags(self):
+        gate = PolicyGate(
+            [
+                {
+                    "id": "p",
+                    "effect": "allow",
+                    "tags": {"team": "core"},
+                    "tag_patterns": {"env": "prod-*"},
+                    "tag_exclude_patterns": {"stage": "tmp-*", "dc": "old-?"},
+                }
+            ]
+        )
+        good = {"team": "core", "env": "prod-eu", "stage": "stable", "dc": "eu1"}
+        self.assertEqual(gate.decide("s", "a", "r", good)["rule"], "p")
+        for mutated in (
+            {"team": "core", "env": "prod-eu", "stage": "tmp-1", "dc": "eu1"},
+            {"team": "core", "env": "prod-eu", "stage": "stable", "dc": "old-1"},
+            {"team": "core", "env": "dev-eu", "stage": "stable", "dc": "eu1"},
+            {"env": "prod-eu", "stage": "stable", "dc": "eu1"},
+        ):
+            self.assertIsNone(
+                gate.decide("s", "a", "r", mutated)["rule"], repr(mutated)
+            )
+
+    def test_deny_priority_and_order_semantics_kept(self):
+        gate = PolicyGate(
+            [
+                {"id": "allow", "effect": "allow", "priority": 10,
+                 "tag_exclude_patterns": {"stage": "tmp-*"}},
+                {"id": "deny", "effect": "deny", "priority": -1,
+                 "tag_exclude_patterns": {"stage": "prod-*"}},
+            ]
+        )
+        # both exclusions avoided: both rules match, explicit deny wins
+        decision = gate.decide("s", "a", "r", {"stage": "stable"})
+        self.assertEqual((decision["effect"], decision["rule"]), ("deny", "deny"))
+        # allow's exclusion hit: only the deny matches
+        decision = gate.decide("s", "a", "r", {"stage": "tmp-1"})
+        self.assertEqual((decision["effect"], decision["rule"]), ("deny", "deny"))
+        # deny's exclusion hit: only the allow matches
+        decision = gate.decide("s", "a", "r", {"stage": "prod-1"})
+        self.assertEqual(
+            (decision["effect"], decision["rule"]), ("allow", "allow")
+        )
+
+    def test_empty_and_missing_exclude_behave_like_legacy(self):
+        self.assertEqual(
+            PolicyGate([{"id": "p", "effect": "allow",
+                         "tag_exclude_patterns": {}}]).to_json(),
+            PolicyGate([{"id": "p", "effect": "allow"}]).to_json(),
+        )
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow", "tag_exclude_patterns": {}}]
+        )
+        self.assertEqual(gate.decide("s", "a", "r")["rule"], "p")
+
+    def test_invalid_tag_exclude_patterns_shape(self):
+        for bad in (
+            "x",
+            ["env"],
+            ("env",),
+            None,
+            True,
+            1,
+            {"env": 1},
+            {"env": None},
+            {"env": True},
+            {"env": ["tmp-*"]},
+            {1: "tmp-*"},
+            {"env": "tmp-*", 2: "x"},
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                PolicyGate([{"effect": "allow", "tag_exclude_patterns": bad}])
+            self.assertTrue(
+                str(ctx.exception).startswith("invalid_tag_exclude_patterns"),
+                "%r -> %s" % (bad, ctx.exception),
+            )
+
+    def test_invalid_tag_exclude_patterns_names_rule_index(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate(
+                [{"effect": "allow"},
+                 {"effect": "deny", "tag_exclude_patterns": "x"}]
+            )
+        self.assertIn("rule 1", str(ctx.exception))
+
+    def test_tag_constraint_conflict(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate(
+                [
+                    {
+                        "effect": "allow",
+                        "tags": {"env": "prod"},
+                        "tag_exclude_patterns": {"env": "*-tmp"},
+                    }
+                ]
+            )
+        self.assertTrue(str(ctx.exception).startswith("tag_constraint_conflict"))
+        self.assertIn("'env'", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate(
+                [
+                    {
+                        "effect": "allow",
+                        "tag_patterns": {"env": "prod-*"},
+                        "tag_exclude_patterns": {"env": "*-tmp"},
+                    }
+                ]
+            )
+        self.assertTrue(str(ctx.exception).startswith("tag_constraint_conflict"))
+        # disjoint keys across the three mappings are fine
+        gate = PolicyGate(
+            [
+                {
+                    "effect": "allow",
+                    "tags": {"team": "core"},
+                    "tag_patterns": {"env": "prod-*"},
+                    "tag_exclude_patterns": {"stage": "tmp-*"},
+                }
+            ]
+        )
+        self.assertEqual(
+            gate.decide(
+                "s", "a", "r",
+                {"team": "core", "env": "prod-x", "stage": "stable"},
+            )["rule"],
+            "0",
+        )
+
+    def test_from_json_raises_same_value_errors(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow", "tag_exclude_patterns": {"env": 1}}]'
+            )
+        self.assertTrue(
+            str(ctx.exception).startswith("invalid_tag_exclude_patterns")
+        )
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow", "tags": {"env": "a"},'
+                ' "tag_exclude_patterns": {"env": "a*"}}]'
+            )
+        self.assertTrue(str(ctx.exception).startswith("tag_constraint_conflict"))
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '[{"effect": "allow", "tag_patterns": {"env": "a*"},'
+                ' "tag_exclude_patterns": {"env": "b*"}}]'
+            )
+        self.assertTrue(str(ctx.exception).startswith("tag_constraint_conflict"))
+
+    def test_trace_tags_match_includes_exclusions(self):
+        gate = PolicyGate(
+            [
+                {"id": "p", "effect": "allow", "tags": {"team": "core"},
+                 "tag_exclude_patterns": {"stage": "tmp-*"}},
+            ]
+        )
+
+        def tags_match(tags):
+            return gate.trace("s", "a", "r", tags)["evaluations"][0]["tags_match"]
+
+        self.assertTrue(tags_match({"team": "core"}))
+        self.assertTrue(tags_match({"team": "core", "stage": "stable"}))
+        self.assertFalse(tags_match({"team": "core", "stage": "tmp-1"}))
+        self.assertTrue(tags_match({"team": "core", "stage": 5}))
+        self.assertFalse(tags_match({"stage": "stable"}))
+        self.assertFalse(tags_match(None))
+
+    def test_batch_entry_points_use_exclusion_constraints(self):
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_exclude_patterns": {"stage": "tmp-*"}}]
+        )
+        batch = [
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"stage": "stable"}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"stage": "tmp-1"}},
+            {"subject": "s", "action": "a", "resource": "r"},
+        ]
+        result = gate.decide_many(batch)
+        self.assertEqual(result["summary"], {"total": 3, "allow": 2, "deny": 1})
+        coverage = gate.coverage(batch)
+        self.assertEqual(
+            coverage["rules"],
+            [{"id": "p", "effect": "allow", "matched": 2, "winner": 2}],
+        )
+        traces = gate.trace_many(batch)
+        self.assertEqual([t["rule"] for t in traces["traces"]], ["p", None, "p"])
+        cases = [
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"stage": "stable"},
+             "expected": {"effect": "allow", "rule": "p"}},
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"stage": "tmp-1"},
+             "expected": {"effect": "deny", "rule": None}},
+        ]
+        self.assertTrue(gate.verify(cases)["ok"])
+
+    def test_compare_against_candidate_with_exclusions(self):
+        baseline = PolicyGate(
+            [{"id": "a", "effect": "allow", "tags": {"env": "prod"}}]
+        )
+        candidate = PolicyGate(
+            [{"id": "a", "effect": "allow", "tags": {"env": "prod"},
+              "tag_exclude_patterns": {"stage": "tmp-*"}}]
+        )
+        batch = [
+            {"subject": "s", "action": "a", "resource": "r",
+             "tags": {"env": "prod", "stage": "tmp-1"}}
+        ]
+        report = baseline.compare(candidate, batch)
+        self.assertEqual(report["summary"]["changed"], 1)
+        self.assertEqual(report["summary"]["allow_to_deny"], 1)
+
+    def test_audit_exclusion_narrows_overlap(self):
+        # positive pattern and exclusion on the same key across rules:
+        # only values satisfying both keep the overlap alive
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_patterns": {"env": "prod-*"}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "*-tmp"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "effect_overlap")
+        self.assertEqual(finding["winner"], "d")
+        witness = finding["witness"]
+        self.assertEqual(witness["tags"], {"env": "prod-"})
+        decision = gate.decide(
+            witness["subject"], witness["action"], witness["resource"],
+            witness["tags"],
+        )
+        self.assertEqual((decision["effect"], decision["rule"]), ("deny", "d"))
+
+    def test_audit_exclusion_blocking_all_values_removes_finding(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_patterns": {"env": "prod-?"}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "prod-*"}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_audit_exact_value_against_exclusion(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"env": "prod"}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "*-tmp"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["tags"], {"env": "prod"})
+
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"env": "prod-tmp"}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "*-tmp"}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+        # a non-string exact value never matches an exclusion pattern
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"env": 1}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "*"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["tags"], {"env": 1})
+
+    def test_audit_exclude_only_key_in_witness(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_exclude_patterns": {"stage": "tmp-*"}},
+                {"id": "d", "effect": "deny"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["tags"], {"stage": ""})
+        decision = gate.decide(
+            finding["witness"]["subject"], finding["witness"]["action"],
+            finding["witness"]["resource"], finding["witness"]["tags"],
+        )
+        self.assertEqual((decision["effect"], decision["rule"]), ("deny", "d"))
+
+    def test_audit_unavoidable_exclusion_removes_finding(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_exclude_patterns": {"stage": "*"}},
+                {"id": "d", "effect": "deny"},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_audit_witness_shortest_avoiding_string(self):
+        # "prod-" itself is excluded, so the witness must grow by the
+        # smallest code point
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_patterns": {"env": "prod-*"}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "prod-"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["witness"]["tags"], {"env": "prod-\x00"})
+
+    def test_audit_shadowed_identical_exclusions(self):
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow",
+                 "tag_exclude_patterns": {"env": "tmp-*"}},
+                {"id": "a2", "effect": "allow",
+                 "tag_exclude_patterns": {"env": "tmp-*"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "shadowed_rule")
+        self.assertEqual(finding["winner"], "a1")
+        self.assertEqual(finding["shadowed"], "a2")
+        self.assertEqual(finding["witness"]["tags"], {"env": ""})
+        # same positive constraints but different exclusions: not identical
+        gate = PolicyGate(
+            [
+                {"id": "a1", "effect": "allow",
+                 "tag_exclude_patterns": {"env": "tmp-*"}},
+                {"id": "a2", "effect": "allow",
+                 "tag_exclude_patterns": {"env": "dev-*"}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_audit_witness_tags_sorted_and_constrained_only(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "tags": {"z": 1},
+                 "tag_exclude_patterns": {"b": "tmp-*"}},
+                {"id": "d", "effect": "deny",
+                 "tag_patterns": {"a": "y[0-9]"},
+                 "tag_exclude_patterns": {"b": "*-old"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        tags = finding["witness"]["tags"]
+        self.assertEqual(tags, {"a": "y0", "b": "", "z": 1})
+        self.assertEqual(list(tags), ["a", "b", "z"])
+        decision = gate.decide(
+            finding["witness"]["subject"], finding["witness"]["action"],
+            finding["witness"]["resource"], tags,
+        )
+        self.assertEqual((decision["effect"], decision["rule"]), ("deny", "d"))
+
+    def test_to_json_exports_exclude_patterns_after_tag_patterns(self):
+        gate = PolicyGate(
+            [
+                {"id": "p", "effect": "allow",
+                 "tag_patterns": {"env": "prod-*"},
+                 "tag_exclude_patterns": {"stage": "tmp-*", "dc": "old-?"}},
+            ]
+        )
+        self.assertEqual(
+            gate.to_json(),
+            '[{"id":"p","effect":"allow","priority":0,"subject":"*",'
+            '"action":"*","resource":"*","tags":{},'
+            '"tag_patterns":{"env":"prod-*"},'
+            '"tag_exclude_patterns":{"dc":"old-?","stage":"tmp-*"}}]',
+        )
+        # without tag_patterns the exclusion mapping still follows tags
+        gate = PolicyGate(
+            [{"id": "p", "effect": "allow",
+              "tag_exclude_patterns": {"stage": "tmp-*"}}]
+        )
+        self.assertEqual(
+            gate.to_json(),
+            '[{"id":"p","effect":"allow","priority":0,"subject":"*",'
+            '"action":"*","resource":"*","tags":{},'
+            '"tag_exclude_patterns":{"stage":"tmp-*"}}]',
+        )
+
+    def test_legacy_snapshot_bytes_and_fingerprint_unchanged(self):
+        legacy = PolicyGate([{"id": "x", "effect": "allow", "tags": {"a": "b"}}])
+        self.assertEqual(
+            legacy.to_json(),
+            '[{"id":"x","effect":"allow","priority":0,"subject":"*",'
+            '"action":"*","resource":"*","tags":{"a":"b"}}]',
+        )
+        import hashlib
+
+        self.assertEqual(
+            legacy.fingerprint(),
+            hashlib.sha256(legacy.to_json().encode("utf-8")).hexdigest(),
+        )
+        excluding = PolicyGate(
+            [{"id": "x", "effect": "allow", "tags": {"a": "b"},
+              "tag_exclude_patterns": {"stage": "tmp-*"}}]
+        )
+        self.assertNotEqual(legacy.fingerprint(), excluding.fingerprint())
+
+    def test_roundtrip_preserves_behavior(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "priority": 3, "subject": "u*",
+                 "tags": {"team": "core"},
+                 "tag_patterns": {"env": "prod-?"},
+                 "tag_exclude_patterns": {"stage": "tmp-*"}},
+                {"id": "d", "effect": "deny", "resource": "secret/*",
+                 "tag_exclude_patterns": {"dc": "old-?"}},
+            ]
+        )
+        loaded = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(loaded.to_json(), gate.to_json())
+        self.assertEqual(loaded.fingerprint(), gate.fingerprint())
+        requests = [
+            {"subject": "u1", "action": "read", "resource": "doc",
+             "tags": {"team": "core", "env": "prod-1", "stage": "stable"}},
+            {"subject": "u1", "action": "read", "resource": "doc",
+             "tags": {"team": "core", "env": "prod-1", "stage": "tmp-1"}},
+            {"subject": "u1", "action": "read", "resource": "secret/x",
+             "tags": {"team": "core", "env": "prod-1", "dc": "new-1"}},
+            {"subject": "u1", "action": "read", "resource": "secret/x",
+             "tags": {"team": "core", "env": "prod-1", "dc": "old-1"}},
+        ]
+        self.assertEqual(loaded.decide_many(requests), gate.decide_many(requests))
+        self.assertEqual(loaded.coverage(requests), gate.coverage(requests))
+        self.assertEqual(loaded.trace_many(requests), gate.trace_many(requests))
+        self.assertEqual(loaded.audit(), gate.audit())
+        for item in requests:
+            args = (
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            self.assertEqual(loaded.explain(*args), gate.explain(*args))
+            self.assertEqual(loaded.trace(*args), gate.trace(*args))
+
+    def test_audit_report_mutation_isolated(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow",
+                 "tag_patterns": {"env": "prod-*"}},
+                {"id": "d", "effect": "deny",
+                 "tag_exclude_patterns": {"env": "*-tmp"}},
+            ]
+        )
+        first = gate.audit()
+        for _ in range(10):
+            self.assertEqual(gate.audit(), first)
+        first["findings"][0]["witness"]["tags"]["env"] = "tampered"
+        fresh = gate.audit()
+        self.assertEqual(
+            fresh["findings"][0]["witness"]["tags"], {"env": "prod-"}
+        )
+        self.assertEqual(gate.rules[0]["tag_patterns"], {"env": "prod-*"})
+        self.assertEqual(
+            gate.rules[1]["tag_exclude_patterns"], {"env": "*-tmp"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
