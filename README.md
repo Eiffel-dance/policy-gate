@@ -13,11 +13,11 @@ Tests: python3 -m unittest discover -s tests -v
 
 `PolicyGate.audit()` 对已加载的规则做纯离线静态检查（不接收请求、无 I/O、不修改规则或后续判定），返回 `{"findings": [...], "summary": {"total", "error", "warning"}}`：
 
-- 按声明顺序检查每对规则；主体/动作/资源模式按 `fnmatch.fnmatchcase` 真实语义判断是否存在共同匹配字符串，标签约束仅在同键不同值时冲突。
+- 按声明顺序检查每对规则；主体/动作/资源模式按 `fnmatch.fnmatchcase` 真实语义判断是否存在共同匹配字符串，标签约束（精确 `tags` 与模式 `tag_patterns`）仅在同键冲突时不可同时满足：两个精确值必须相等，精确值与模式共存时精确值必须匹配该模式，两个模式必须存在共同字符串。
 - 非等价选择器且 effect 不同的重叠产生一条 `effect_overlap`（error），`winner` 为重叠范围内获胜的 deny 规则（显式拒绝覆盖 allow，priority 不改变结果）。
-- 三个模式文本和标签完全相同的选择器产生一条 `shadowed_rule`：allow 被 deny 遮蔽为 error，相同 effect 为 warning（按优先级再按声明顺序确定被遮蔽方）。
+- 三个模式文本、精确标签和模式标签完全相同的选择器产生一条 `shadowed_rule`：allow 被 deny 遮蔽为 error，相同 effect 为 warning（按优先级再按声明顺序确定被遮蔽方）。
 - 相同 effect 的部分重叠不算冲突。每条 finding 固定含 `code`、`severity`、`rule`、`other_rule`、`winner`、`shadowed`、`reason`、`witness`；无法完全遮蔽时 `shadowed` 为 `None`。无重叠选择器时返回空报告。
-- `witness` 是一个确实能触发该 finding 的最小见证请求，固定含 `subject`、`action`、`resource`、`tags` 四个键：把它交回 `decide`/`explain` 必然同时命中该对规则（`effect_overlap` 下 deny 必然最终生效）。三个字符串字段各自独立地取所有同时匹配两条规则 `fnmatch.fnmatchcase` 模式的字符串中最短者，长度相同取 Unicode 码点字典序最小者，允许空字符串；`tags` 只合并两条规则的标签约束（共享键值在产生 finding 时必相同，互不冲突的键全部保留，键按 Unicode 码点顺序输出，不凭空添加标签）。直接构造与 `from_json` 得到的相同规则生成完全相同的 witness，重复调用返回相等结果，修改返回的报告不影响后续调用。
+- `witness` 是一个确实能触发该 finding 的最小见证请求，固定含 `subject`、`action`、`resource`、`tags` 四个键：把它交回 `decide`/`explain` 必然同时命中该对规则（`effect_overlap` 下 deny 必然最终生效）。三个字符串字段各自独立地取所有同时匹配两条规则 `fnmatch.fnmatchcase` 模式的字符串中最短者，长度相同取 Unicode 码点字典序最小者，允许空字符串；`tags` 只合并两条规则的标签约束（精确约束取其值，仅由模式约束的键取同时满足所有模式的最短字符串、长度相同按 Unicode 码点字典序，键按 Unicode 码点顺序输出，不凭空添加标签）。直接构造与 `from_json` 得到的相同规则生成完全相同的 witness，重复调用返回相等结果，修改返回的报告不影响后续调用。
 
 ## 可复核策略快照
 
@@ -68,3 +68,13 @@ Tests: python3 -m unittest discover -s tests -v
 - 返回内容为独立深拷贝，修改返回值不影响后续调用；重复调用、直接构造与 `from_json` 加载的同一规则结果相同。`verify` 不修改任何规则或输入、不产生外部 I/O，也不改变既有公开 API 的校验、字段、优先级与异常行为。
 
 
+## 标签模式约束（tag_patterns）
+
+规则可携带可选的 `tag_patterns` 映射，用字符串模式约束标签值，避免为一组环境或资源重复复制规则；纯离线、只读，不改变任何既有入口的形状与异常边界。
+
+- 键必须是字符串标签名，值是按 `fnmatch.fnmatchcase` 语义解释的字符串模式；同一键不得同时出现在 `tags` 与 `tag_patterns` 中。未提供该字段按空映射处理，不含该字段的旧规则在构造、判定、批量行为与异常边界上完全不变。
+- 形状错误（非映射、非字符串键或非字符串值）在 `PolicyGate` 构造与 `from_json` 加载阶段统一抛出消息以 `invalid_tag_patterns` 为前缀的 `ValueError`；同键冲突抛出消息以 `tag_constraint_conflict` 为前缀的 `ValueError`，绝不延迟到 `decide`。
+- 规则匹配须同时满足主体、动作、资源通配、精确标签和全部模式标签；对模式标签而言，请求缺少该键或对应值不是字符串只表示该规则不匹配。请求的 `tags` 仍可省略、为 `None` 或任意 mapping。显式 deny、priority、声明顺序与默认拒绝语义不变。
+- `explain`/`trace` 的字段保持不变，其中 `tags_match` 反映精确与模式两类标签约束的合取；`decide_many`、`verify`、`coverage`、`compare`、`trace_many` 的输出形状与错误码沿用当前定义。
+- `audit` 把模式标签纳入重叠、遮蔽与 witness 判断；`witness.tags` 只含两条规则的约束并按 Unicode 键序输出，每个模式标签取同时满足约束的最短字符串（长度相同按 Unicode 码点字典序），witness 能重放对应 finding。
+- `to_json` 对使用 `tag_patterns` 的规则按固定顺序紧跟 `tags` 导出该字段（键按 Unicode 码位排序），`fingerprint` 随其变化；完全未使用该字段的规则保持既有字节级输出，往返 `from_json` 后所有公开方法给出相同结果。

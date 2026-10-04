@@ -6,7 +6,16 @@ import math
 from collections.abc import Mapping
 
 _ALLOWED_FIELDS = frozenset(
-    {"id", "effect", "priority", "subject", "action", "resource", "tags"}
+    {
+        "id",
+        "effect",
+        "priority",
+        "subject",
+        "action",
+        "resource",
+        "tags",
+        "tag_patterns",
+    }
 )
 _STRING_FIELDS = ("subject", "action", "resource")
 _REQUEST_FIELDS = frozenset({"subject", "action", "resource", "tags"})
@@ -425,18 +434,44 @@ def _min_common_string(t1, t2):
     return None if result is None else result[1]
 
 
-def _merge_witness_tags(tags1, tags2):
-    """Joint tag assignment satisfying both rules' exact constraints.
+def _merge_witness_tags(r1, r2, tp1, tp2):
+    """Joint tag assignment satisfying both rules' tag constraints.
 
-    Findings only arise when shared keys carry equal values, so the union
-    is conflict-free; keys are emitted in Unicode code-point order and no
-    other tag is invented. Values are deep-copied (direct construction
-    permits mutable tag values) so a caller mutating a returned report can
-    never touch the loaded rules or later reports.
+    ``tp1``/``tp2`` are the tokenized ``tag_patterns`` of the two rules.
+    Findings only arise when the constraints are jointly satisfiable, so
+    the merge is conflict-free; keys are emitted in Unicode code-point
+    order and no other tag is invented. A key constrained by an exact
+    value (on either rule, or both with equal values) takes that value;
+    a key constrained only by patterns takes the shortest string
+    satisfying every pattern on it, ties broken by Unicode code-point
+    lexicographic order. Exact values are deep-copied (direct
+    construction permits mutable tag values) so a caller mutating a
+    returned report can never touch the loaded rules or later reports.
     """
-    merged = dict(tags1)
-    merged.update(tags2)
-    return {key: copy.deepcopy(merged[key]) for key in sorted(merged)}
+    keys = (
+        set(r1["tags"])
+        | set(r2["tags"])
+        | set(r1["tag_patterns"])
+        | set(r2["tag_patterns"])
+    )
+    merged = {}
+    for key in keys:
+        exact = None
+        has_exact = False
+        for rule in (r1, r2):
+            if key in rule["tags"]:
+                exact = rule["tags"][key]
+                has_exact = True
+                break
+        if has_exact:
+            merged[key] = copy.deepcopy(exact)
+            continue
+        patterns = [tp[key] for tp in (tp1, tp2) if key in tp]
+        if len(patterns) == 2:
+            merged[key] = _min_common_string(patterns[0], patterns[1])
+        else:
+            merged[key] = _min_common_string(patterns[0], patterns[0])
+    return {key: merged[key] for key in sorted(merged)}
 
 
 def _pair_witness(r1, r2, c1, c2):
@@ -445,7 +480,7 @@ def _pair_witness(r1, r2, c1, c2):
         "subject": _min_common_string(c1[0], c2[0]),
         "action": _min_common_string(c1[1], c2[1]),
         "resource": _min_common_string(c1[2], c2[2]),
-        "tags": _merge_witness_tags(r1["tags"], r2["tags"]),
+        "tags": _merge_witness_tags(r1, r2, c1[3], c2[3]),
     }
 
 
@@ -484,10 +519,46 @@ def _patterns_overlap(t1, t2):
     return bool(row[0])
 
 
-def _tags_compatible(t1, t2):
-    # Constraints on disjoint keys are jointly satisfiable (the caller may
-    # supply extra tags); only a shared key with different values conflicts.
-    return all(k not in t2 or t2[k] == v for k, v in t1.items())
+def _tag_constraints_compatible(r1, r2, tp1, tp2):
+    """True iff both rules' exact and pattern tag constraints can hold at once.
+
+    ``tp1``/``tp2`` are the tokenized ``tag_patterns`` of the two rules.
+    Constraints on disjoint keys are jointly satisfiable (the caller may
+    supply extra tags). On a shared key, two exact values conflict unless
+    equal; an exact value and a pattern conflict unless the value is a
+    string matching the pattern under fnmatch.fnmatchcase semantics; two
+    patterns conflict unless some string matches both.
+    """
+    keys = (
+        set(r1["tags"])
+        | set(r2["tags"])
+        | set(r1["tag_patterns"])
+        | set(r2["tag_patterns"])
+    )
+    for key in keys:
+        exacts = []
+        patterns = []
+        for rule, tokenized in ((r1, tp1), (r2, tp2)):
+            if key in rule["tags"]:
+                exacts.append(rule["tags"][key])
+            elif key in tokenized:
+                patterns.append((rule["tag_patterns"][key], tokenized[key]))
+        if len(exacts) == 2 and exacts[0] != exacts[1]:
+            return False
+        if exacts:
+            value = exacts[0]
+            if patterns:
+                if not isinstance(value, str):
+                    return False
+                if not all(
+                    fnmatch.fnmatchcase(value, text) for text, _ in patterns
+                ):
+                    return False
+        elif len(patterns) == 2 and not _patterns_overlap(
+            patterns[0][1], patterns[1][1]
+        ):
+            return False
+    return True
 
 
 def _audit_pair(r1, r2, c1, c2):
@@ -496,7 +567,7 @@ def _audit_pair(r1, r2, c1, c2):
         _patterns_overlap(c1[0], c2[0])
         and _patterns_overlap(c1[1], c2[1])
         and _patterns_overlap(c1[2], c2[2])
-        and _tags_compatible(r1["tags"], r2["tags"])
+        and _tag_constraints_compatible(r1, r2, c1[3], c2[3])
     ):
         return None
 
@@ -505,6 +576,7 @@ def _audit_pair(r1, r2, c1, c2):
         and r1["action"] == r2["action"]
         and r1["resource"] == r2["resource"]
         and r1["tags"] == r2["tags"]
+        and r1["tag_patterns"] == r2["tag_patterns"]
     )
     if identical:
         # Identical selectors: one rule can never win, so it is shadowed.
@@ -612,6 +684,22 @@ class PolicyGate:
                     "rule %d: field 'tags' must be a mapping with string keys" % i
                 )
 
+            tag_patterns = r.get("tag_patterns", {})
+            if not isinstance(tag_patterns, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in tag_patterns.items()
+            ):
+                raise ValueError(
+                    "invalid_tag_patterns: rule %d: field 'tag_patterns' "
+                    "must be a mapping with string keys and string values" % i
+                )
+            conflict = sorted(set(tags) & set(tag_patterns))
+            if conflict:
+                raise ValueError(
+                    "tag_constraint_conflict: rule %d: key %r appears in "
+                    "both 'tags' and 'tag_patterns'" % (i, conflict[0])
+                )
+
             unsupported = set(r) - _ALLOWED_FIELDS
             if unsupported:
                 raise ValueError(
@@ -627,6 +715,7 @@ class PolicyGate:
                     "action": r.get("action", "*"),
                     "resource": r.get("resource", "*"),
                     "tags": tags,
+                    "tag_patterns": tag_patterns,
                     "_index": i,
                 }
             )
@@ -694,15 +783,20 @@ class PolicyGate:
     def _snapshot(self):
         """Normalized rules ready for canonical JSON serialization.
 
-        Only the seven effective fields are copied, in fixed order, so the
-        internal ``_index`` never leaks; the copy is shallow, and only read
-        by the serializer, so neither the rules nor caller-provided
-        mappings are mutated.
+        The seven always-present effective fields are copied in fixed
+        order, so the internal ``_index`` never leaks; ``tag_patterns``
+        follows ``tags`` as an eighth field, but only on rules that
+        actually use it, so snapshots of legacy rules stay byte-identical.
+        The copy is shallow, and only read by the serializer, so neither
+        the rules nor caller-provided mappings are mutated.
         """
-        return [
-            _FixedObject([(field, rule[field]) for field in self._SNAPSHOT_FIELDS])
-            for rule in self.rules
-        ]
+        snapshot = []
+        for rule in self.rules:
+            fields = [(field, rule[field]) for field in self._SNAPSHOT_FIELDS]
+            if rule["tag_patterns"]:
+                fields.append(("tag_patterns", rule["tag_patterns"]))
+            snapshot.append(_FixedObject(fields))
+        return snapshot
 
     def to_json(self):
         """Export the loaded rules as canonical strict-JSON text.
@@ -711,7 +805,10 @@ class PolicyGate:
         rule writes its normalized, actually-effective ``id``, ``effect``,
         ``priority``, ``subject``, ``action``, ``resource`` and ``tags``
         in that fixed order, so all defaults appear explicitly and no
-        internal index leaks. Tag objects (at every nesting level) have
+        internal index leaks. A rule with a non-empty ``tag_patterns``
+        mapping writes it as an eighth field immediately after ``tags``;
+        rules without pattern constraints keep the legacy seven-field
+        shape byte for byte. Tag objects (at every nesting level) have
         their keys sorted by Unicode code point; separators are compact
         and non-ASCII characters are emitted unescaped. An empty rule set
         exports as ``[]`` and repeated calls return identical text while
@@ -739,12 +836,24 @@ class PolicyGate:
         return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _tags_match(rule, tags):
+        # Exact constraints compare values for equality; pattern
+        # constraints require the request value to be a string matching
+        # the rule's fnmatch.fnmatchcase pattern. A missing key or a
+        # non-string value simply fails the pattern constraint.
+        return all(tags.get(k) == v for k, v in rule["tags"].items()) and all(
+            isinstance(tags.get(k), str)
+            and fnmatch.fnmatchcase(tags.get(k), pattern)
+            for k, pattern in rule["tag_patterns"].items()
+        )
+
+    @staticmethod
     def _matches(rule, subject, action, resource, tags):
         return (
             fnmatch.fnmatchcase(subject, rule["subject"])
             and fnmatch.fnmatchcase(action, rule["action"])
             and fnmatch.fnmatchcase(resource, rule["resource"])
-            and all(tags.get(k) == v for k, v in rule["tags"].items())
+            and PolicyGate._tags_match(rule, tags)
         )
 
     @staticmethod
@@ -1220,8 +1329,10 @@ class PolicyGate:
         ``resource_match``, ``tags_match``, ``matched``, ``selected``.
         The first three flags compare subject/action/resource against the
         rule's glob patterns with ``fnmatch.fnmatchcase``; ``tags_match``
-        applies the rule's exact tag constraints (``tags=None`` counts as
-        an empty mapping). ``matched`` is the conjunction of the four
+        applies the rule's exact tag constraints and ``tag_patterns``
+        pattern constraints together (``tags=None`` counts as an empty
+        mapping; a missing key or non-string value fails a pattern
+        constraint). ``matched`` is the conjunction of the four
         flags; ``selected`` is true only on the final winning rule, and
         false everywhere when the request falls through to the default
         deny (``rule`` is then ``None``).
@@ -1237,7 +1348,7 @@ class PolicyGate:
             subject_match = fnmatch.fnmatchcase(subject, r["subject"])
             action_match = fnmatch.fnmatchcase(action, r["action"])
             resource_match = fnmatch.fnmatchcase(resource, r["resource"])
-            tags_match = all(tags.get(k) == v for k, v in r["tags"].items())
+            tags_match = self._tags_match(r, tags)
             rule_matched = (
                 subject_match and action_match and resource_match and tags_match
             )
@@ -1308,16 +1419,19 @@ class PolicyGate:
         Every pair of rules is checked in declaration order. Two
         selectors overlap when some subject/action/resource string
         matches both glob patterns under fnmatch.fnmatchcase semantics
-        and their tag constraints are jointly satisfiable (only a shared
-        tag key with different values conflicts; extra caller tags do not
-        matter). Overlapping selectors with different effects yield one
+        and their tag constraints are jointly satisfiable: on a shared
+        key, two exact values must be equal, an exact value must be a
+        string matching the other rule's pattern, and two patterns must
+        share at least one common string; extra caller tags do not
+        matter. Overlapping selectors with different effects yield one
         ``effect_overlap`` error finding whose winner is the deny rule —
         explicit deny overrides allow, and priority cannot change that.
-        Selectors with identical pattern texts and tags yield one
-        ``shadowed_rule`` finding instead: an error when deny shadows
-        allow, a warning when same-effect rules collide (the loser by
-        priority, then declaration order, is shadowed). Same-effect
-        partial overlaps are not conflicts and produce no finding.
+        Selectors with identical pattern texts, tags and tag_patterns
+        yield one ``shadowed_rule`` finding instead: an error when deny
+        shadows allow, a warning when same-effect rules collide (the
+        loser by priority, then declaration order, is shadowed).
+        Same-effect partial overlaps are not conflicts and produce no
+        finding.
 
         Returns ``{"findings": [...], "summary": {"total", "error",
         "warning"}}``. Each finding has the fixed keys ``code``,
@@ -1331,16 +1445,18 @@ class PolicyGate:
         ``witness`` is a concrete request that actually triggers the
         finding, with exactly the keys ``subject``, ``action``,
         ``resource`` and ``tags``: replaying it through decide() matches
-        both rules of the pair under fnmatch.fnmatchcase semantics and the
-        pair's exact tag constraints, so it reproduces the reported
-        effect overlap or full shadowing. For each string field the
-        witness is the shortest string matching both rules' patterns,
-        ties broken by Unicode code-point lexicographic order (the empty
-        string is allowed), and the three fields are chosen
-        independently. ``tags`` merges both rules' constraints only:
-        shared keys already carry equal values for a reported pair, all
-        non-conflicting keys are retained, keys are emitted in Unicode
-        code-point order, and no other request tag is invented. Rules
+        both rules of the pair under fnmatch.fnmatchcase semantics and
+        the pair's exact and pattern tag constraints, so it reproduces
+        the reported effect overlap or full shadowing. For each string
+        field the witness is the shortest string matching both rules'
+        patterns, ties broken by Unicode code-point lexicographic order
+        (the empty string is allowed), and the three fields are chosen
+        independently. ``tags`` merges both rules' constraints only: a
+        shared key constrained by an exact value takes that value, a key
+        constrained only by patterns takes the shortest string matching
+        every pattern on it (ties broken by Unicode code-point
+        lexicographic order), keys are emitted in Unicode code-point
+        order, and no other request tag is invented. Rules
         built directly and via from_json produce identical witnesses,
         repeated calls return equal results, and mutating a returned
         report never affects later calls.
@@ -1350,6 +1466,10 @@ class PolicyGate:
                 _tokenize_pattern(r["subject"]),
                 _tokenize_pattern(r["action"]),
                 _tokenize_pattern(r["resource"]),
+                {
+                    key: _tokenize_pattern(pattern)
+                    for key, pattern in r["tag_patterns"].items()
+                },
             )
             for r in self.rules
         ]
