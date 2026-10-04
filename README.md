@@ -9,6 +9,15 @@ Tests: python3 -m unittest discover -s tests -v
 
 实现一个无网络的策略判定器，按主体、动作、资源和标签匹配规则并返回可解释的 allow 或 deny 决策。规则优先级、显式拒绝、默认拒绝、通配匹配和冲突处理必须有稳定定义；判定结果要包含命中的规则和原因，配置错误在加载阶段失败，便于在发布前做离线安全检查。
 
+## 配置所有权与构造期复制
+
+`PolicyGate(rules)` 在构造成功前完成全部校验与归一化复制，加载成功的 gate 完全拥有自己的规则数据；构造失败不留下只复制了一部分规则的实例。
+
+- 构造后调用方再修改传入的外层序列、规则字典、`tags`、`tag_patterns`、`tag_exclude_patterns`、`tag_presence` 映射或其中的嵌套可变值，都不会改变该 gate 后续 `decide`、`explain`、`decide_many`、`trace`、`trace_many`、`coverage`、`verify`、`audit`、`compare`、`rule_change_report`、`to_json` 和 `fingerprint` 的结果；同一输入重复调用仍相等。
+- 标量字段（`id`、`effect`、`priority`、三个选择器与三个排除字段）校验后均为不可变类型，按当前语义原样保存；标签值可以是任意嵌套可变对象，构造期深拷贝，复制不改变可接受配置的类型或相等性。
+- 遇到无法独立复制的标签值时，构造阶段抛出消息带固定标识 `non_copyable_value` 的 `ValueError`，不返回可用的半成品；既有校验错误的类型、消息与优先级保持不变。
+- `from_json` 行为不变；`to_json` 与 `fingerprint` 不泄露复制过程或内部 `_index`；`explain`、`trace`、`audit`、`coverage`、`compare`、`rule_change_report` 返回的数据与内部规则隔离，修改已返回对象不会反向污染后续判定。
+
 ## 发布前审计
 
 `PolicyGate.audit()` 对已加载的规则做纯离线静态检查（不接收请求、无 I/O、不修改规则或后续判定），返回 `{"findings": [...], "summary": {"total", "error", "warning"}}`：

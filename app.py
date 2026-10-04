@@ -140,6 +140,26 @@ def _json_snapshot_error(kind):
     return ValueError("[non_json_value] rule snapshot contains %s" % kind)
 
 
+def _own_tag_mapping(tags, index):
+    """Deep-copy a validated ``tags`` mapping for the gate's own use.
+
+    Direct construction accepts arbitrary tag values, including nested
+    mutable containers, and the gate must own its rule data outright:
+    after construction returns, mutating the caller's mapping or any
+    nested value inside it must not change this gate's decisions or
+    snapshots. A value that cannot be copied independently raises
+    ``ValueError`` tagged ``non_copyable_value`` here, during
+    construction, so no partially copied rule list can escape.
+    """
+    try:
+        return copy.deepcopy(tags)
+    except Exception:
+        raise ValueError(
+            "non_copyable_value: rule %d: field 'tags' holds a value "
+            "that cannot be independently copied" % index
+        ) from None
+
+
 class _FixedObject:
     """A JSON object whose keys must appear in a fixed order."""
 
@@ -877,13 +897,21 @@ class PolicyGate:
     """Offline policy evaluator.
 
     Rules are fully validated at construction time; decide() only performs
-    deterministic matching over the normalized rule list.
+    deterministic matching over the normalized rule list. Construction
+    also copies every caller-provided mapping into gate-owned data, so
+    mutating the original configuration afterwards cannot change any
+    decision, report or snapshot; a tag value that cannot be copied
+    independently fails construction with a ``ValueError`` tagged
+    ``non_copyable_value``.
     """
 
     def __init__(self, rules):
         if not isinstance(rules, (list, tuple)):
             raise ValueError("rules must be a sequence of rule mappings")
-        self.rules = []
+        # Normalized rules accumulate in a local list and only become
+        # instance state after every rule has validated and been copied,
+        # so a failed construction never leaves a partially copied gate.
+        normalized = []
         seen_ids = set()
         for i, r in enumerate(rules):
             if not isinstance(r, dict):
@@ -1010,7 +1038,18 @@ class PolicyGate:
                     "rule %d: unsupported field %r" % (i, sorted(unsupported)[0])
                 )
 
-            self.rules.append(
+            # The gate owns its rule data: every caller-provided
+            # mapping is copied after validation, so later caller-side
+            # mutation of the outer sequence, the rule mappings, these
+            # tag mappings or any nested mutable value inside them
+            # cannot change this gate's decisions, reports or snapshots.
+            # Scalars are validated immutables (str/int/bool) and need
+            # no copy; tag values may be arbitrary nested mutables and
+            # are deep-copied (a non-copyable value raises ValueError
+            # tagged non_copyable_value before anything is stored).
+            # Copying never changes the type or equality of an
+            # acceptable configuration.
+            normalized.append(
                 {
                     "id": rid,
                     "effect": effect,
@@ -1021,13 +1060,15 @@ class PolicyGate:
                     "subject_exclude": r.get("subject_exclude"),
                     "action_exclude": r.get("action_exclude"),
                     "resource_exclude": r.get("resource_exclude"),
-                    "tags": tags,
-                    "tag_patterns": tag_patterns,
-                    "tag_exclude_patterns": tag_exclude_patterns,
-                    "tag_presence": tag_presence,
+                    "tags": _own_tag_mapping(tags, i),
+                    "tag_patterns": dict(tag_patterns),
+                    "tag_exclude_patterns": dict(tag_exclude_patterns),
+                    "tag_presence": dict(tag_presence),
                     "_index": i,
                 }
             )
+
+        self.rules = normalized
 
     @classmethod
     def from_json(cls, document):
