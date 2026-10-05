@@ -21,13 +21,24 @@ Tests: python3 -m unittest discover -s tests -v
 
 ## 可复核策略快照
 
-`PolicyGate.to_json()` 把已加载规则导出为规范的严格 JSON 文本，供发布前离线比较；`fingerprint()` 返回同一快照 UTF-8 字节的 SHA-256 小写十六进制摘要（固定 64 字符）。
+`PolicyGate.to_json()` 把已加载规则导出为规范的严格 JSON 文本，供发布前离线比较；`fingerprint()` 返回同一规则快照 UTF-8 字节的 SHA-256 小写十六进制摘要（固定 64 字符）。摘要恒为规则数组快照的摘要，与是否使用版本化封装无关，因此同一规则集无论以哪种文档形式加载，`fingerprint()` 都相同。
 
 - 根为数组，规则保持声明顺序；每条规则按固定顺序写出归一化后实际生效的 `id`、`effect`、`priority`、`subject`、`action`、`resource`、`tags`，默认值显式出现，内部 `_index` 不泄露。
+- 直接构造或从旧版根数组加载的 gate 始终导出该规范数组（`document_version` 为 `None`）；从版本化封装文档加载的 gate 改为导出封装对象，详见“版本化策略文档”。
 - `tags` 及其任意层级嵌套对象的键按 Unicode 码位排序；使用紧凑分隔符（无空白），非 ASCII 字符原样保留（不转义）。空规则导出 `[]`；规则不变时重复调用得到逐字节相同的文本。
 - 导出文本可由 `from_json` 无损重新加载，重载后的 `decide`、`explain`、`decide_many`、`audit` 与原实例完全一致；导出不修改规则或调用方提供的映射。
 - 直接构造的规则若含不能无损表示为严格 JSON 的值（元组、集合、非有限数字、含非字符串键的嵌套映射，或无法 UTF-8 编码的孤立代理项），`to_json` 与 `fingerprint` 均抛出消息含固定标识 `non_json_value` 的 `ValueError`，且不返回任何部分文本。
 - 快照功能纯离线：无文件、网络或其他外部 I/O。
+
+## 版本化策略文档
+
+`PolicyGate.from_json` 在保留旧版根数组的同时，接受根为对象的版本化封装，供发布前加载阶段确认文档格式与策略身份；不改变直接构造、旧数组文档以及 `decide`、`explain`、`trace`、`audit`、`compare` 等既有方法的结果和异常边界。
+
+- 封装对象只允许 `version`、`rules`、`fingerprint` 三个键：`version` 必须为整数 `1`（布尔值不视为整数，其他整数版本报不支持），`rules` 必须为规则数组（规则字段继续沿用现有构造校验），`fingerprint` 可省略；提供时必须为 64 位小写十六进制 SHA-256 字符串，且等于 `rules` 归一化规范快照（即旧版根数组 `to_json()` 字节）的 `fingerprint()`。
+- 加载阶段按固定顺序报告首个错误，均抛 `PolicyConfigError`（带 `code`）：根值既非数组也非对象报 `root_not_array_or_object`；未知键、缺失 `version`、`version` 类型错误、版本不支持、缺失 `rules`、`rules` 类型错误、摘要格式错误、摘要不匹配依次报 `unknown_document_field`、`missing_version`、`invalid_version`、`unsupported_version`、`missing_rules`、`rules_not_array`、`invalid_fingerprint`、`fingerprint_mismatch`。重复键、非法 JSON 继续报 `duplicate_key`、`invalid_json`；规则内部语义错误仍抛普通 `ValueError`。
+- 成功加载封装后 gate 的 `document_version` 为 `1`，`to_json()` 按 `version`、`rules`、`fingerprint` 的固定键序输出规范封装对象，并原样保留输入 `fingerprint`（加载时未提供则补入当前规则快照摘要，使导出文档自校验）；旧根数组和直接构造的 gate 仍输出既有规范数组，`document_version` 为 `None`。
+- `rules` 字段内容、标签键排序、默认值补全与指纹算法与既有快照完全一致：`fingerprint()` 恒为规则数组快照的摘要，不随封装变化。`from_json(to_json())` 往返后所有判定、解释、追踪、审计和比较结果逐值相同。
+- 加载与导出保持离线、只读：不修改调用方传入的规则或标签映射，不产生任何 I/O；空规则、显式拒绝、优先级、通配匹配与默认拒绝语义不变。
 
 ## 策略版本回归比较
 

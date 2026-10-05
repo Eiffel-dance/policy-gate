@@ -31,15 +31,21 @@ _CASE_FIELDS = frozenset(
 )
 _EXPECTATION_FIELDS = frozenset({"effect", "rule"})
 _REQUIRED_CASE_FIELDS = ("subject", "action", "resource", "expected")
+_DOCUMENT_FIELDS = frozenset({"version", "rules", "fingerprint"})
+_HEX_LOWERCASE = frozenset("0123456789abcdef")
 
 
 class PolicyConfigError(Exception):
     """A JSON policy document could not be loaded.
 
     The machine-readable ``code`` attribute distinguishes failure classes:
-    ``invalid_json``, ``duplicate_key``, ``root_not_array`` or
-    ``rule_not_object``. Semantic problems inside an otherwise well-formed
-    rule object keep raising plain ``ValueError`` (see ``PolicyGate``).
+    ``invalid_json``, ``duplicate_key``, ``root_not_array_or_object``,
+    ``rule_not_object``, or one of the versioned-document codes
+    ``unknown_document_field``, ``missing_version``, ``invalid_version``,
+    ``unsupported_version``, ``missing_rules``, ``rules_not_array``,
+    ``invalid_fingerprint`` and ``fingerprint_mismatch``. Semantic problems
+    inside an otherwise well-formed rule object keep raising plain
+    ``ValueError`` (see ``PolicyGate``).
     """
 
     def __init__(self, code, message):
@@ -1076,26 +1082,53 @@ class PolicyGate:
         # gate take ownership, so construction can never expose a
         # half-populated instance.
         self.rules = normalized
+        # Directly constructed gates and legacy root-array documents have
+        # no versioned envelope; from_json on a versioned document flips
+        # these after construction (rules only, leaving decisions intact).
+        self.document_version = None
+        self.document_fingerprint = None
 
     @classmethod
     def from_json(cls, document):
         """Build a gate from a JSON text document.
 
-        ``document`` must be a ``str`` whose root JSON value is an array of
-        rule objects. Loading performs no decisions, no I/O and never
+        ``document`` must be a ``str`` whose root JSON value is either an
+        array of rule objects (the legacy document form) or a versioned
+        envelope object. Loading performs no decisions, no I/O and never
         mutates the input text; on failure no partially built instance
         escapes this method.
 
+        The legacy root array keeps every existing behavior: the gate's
+        :attr:`document_version` is ``None`` and :meth:`to_json` keeps
+        exporting the canonical rule array.
+
+        The versioned envelope permits exactly the keys ``version``,
+        ``rules`` and ``fingerprint``. ``version`` must be the integer
+        ``1`` (booleans are not integers), ``rules`` must be an array of
+        rule objects, and ``fingerprint`` may be omitted; when present it
+        must be a 64-character lowercase hex SHA-256 digest equal to
+        :meth:`fingerprint` over the normalized rules snapshot. A gate
+        loaded this way has :attr:`document_version` set to ``1`` and
+        :meth:`to_json` emits the canonical envelope with the keys in the
+        fixed order ``version``, ``rules``, ``fingerprint``, preserving
+        the input fingerprint.
+
         Structural JSON problems raise :class:`PolicyConfigError` with a
-        ``code`` of ``invalid_json``, ``duplicate_key``, ``root_not_array``
-        or ``rule_not_object``; semantic rule errors raise ``ValueError``
-        exactly like the direct constructor (naming the first bad index).
+        ``code`` of ``invalid_json``, ``duplicate_key``,
+        ``root_not_array_or_object`` or ``rule_not_object``; a malformed
+        envelope reports the first failing check, in order, as
+        ``unknown_document_field``, ``missing_version``,
+        ``invalid_version``, ``unsupported_version``, ``missing_rules``,
+        ``rules_not_array``, ``invalid_fingerprint`` or
+        ``fingerprint_mismatch``. Semantic rule errors raise
+        ``ValueError`` exactly like the direct constructor (naming the
+        first bad index).
         """
         if not isinstance(document, str):
             raise TypeError("document must be a JSON text string")
 
         try:
-            rules = json.loads(
+            loaded = json.loads(
                 document,
                 object_pairs_hook=_reject_duplicate_keys,
                 parse_constant=_reject_constant,
@@ -1109,12 +1142,73 @@ class PolicyGate:
                 "invalid_json", "document is not valid JSON: %s" % exc
             ) from None
 
+        if isinstance(loaded, list):
+            return cls._from_legacy_array(loaded)
+        if not isinstance(loaded, dict):
+            raise PolicyConfigError(
+                "root_not_array_or_object",
+                "root JSON value must be an array or object, got %s"
+                % type(loaded).__name__,
+            )
+        return cls._from_versioned_document(loaded)
+
+    @classmethod
+    def _from_legacy_array(cls, rules):
+        for i, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                raise PolicyConfigError(
+                    "rule_not_object",
+                    "rule %d: array element must be a JSON object, got %s"
+                    % (i, type(rule).__name__),
+                )
+        return cls(rules)
+
+    @classmethod
+    def _from_versioned_document(cls, document):
+        unknown = sorted(set(document) - _DOCUMENT_FIELDS)
+        if unknown:
+            raise PolicyConfigError(
+                "unknown_document_field",
+                "versioned document contains unknown field %r" % unknown[0],
+            )
+        if "version" not in document:
+            raise PolicyConfigError(
+                "missing_version", "versioned document is missing 'version'"
+            )
+        version = document["version"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise PolicyConfigError(
+                "invalid_version",
+                "'version' must be an integer, got %s"
+                % type(version).__name__,
+            )
+        if version != 1:
+            raise PolicyConfigError(
+                "unsupported_version",
+                "unsupported document version %r" % version,
+            )
+        if "rules" not in document:
+            raise PolicyConfigError(
+                "missing_rules", "versioned document is missing 'rules'"
+            )
+        rules = document["rules"]
         if not isinstance(rules, list):
             raise PolicyConfigError(
-                "root_not_array",
-                "root JSON value must be an array, got %s"
-                % type(rules).__name__,
+                "rules_not_array",
+                "'rules' must be an array, got %s" % type(rules).__name__,
             )
+        provided_fingerprint = None
+        if "fingerprint" in document:
+            provided_fingerprint = document["fingerprint"]
+            if not isinstance(provided_fingerprint, str) or not (
+                len(provided_fingerprint) == 64
+                and all(ch in _HEX_LOWERCASE for ch in provided_fingerprint)
+            ):
+                raise PolicyConfigError(
+                    "invalid_fingerprint",
+                    "'fingerprint' must be a 64-character lowercase hex "
+                    "SHA-256 digest",
+                )
         for i, rule in enumerate(rules):
             if not isinstance(rule, dict):
                 raise PolicyConfigError(
@@ -1123,7 +1217,21 @@ class PolicyGate:
                     % (i, type(rule).__name__),
                 )
 
-        return cls(rules)
+        # Semantic rule validation runs exactly as for every other path;
+        # a ValueError here is the constructor's, not a PolicyConfigError.
+        gate = cls(rules)
+        if provided_fingerprint is not None:
+            actual_fingerprint = gate.fingerprint()
+            if actual_fingerprint != provided_fingerprint:
+                raise PolicyConfigError(
+                    "fingerprint_mismatch",
+                    "document fingerprint does not match the rules snapshot: "
+                    "expected %s, got %s"
+                    % (actual_fingerprint, provided_fingerprint),
+                )
+            gate.document_fingerprint = provided_fingerprint
+        gate.document_version = version
+        return gate
 
     # --- canonical snapshot export ------------------------------------
 
@@ -1199,7 +1307,9 @@ class PolicyGate:
     def to_json(self):
         """Export the loaded rules as canonical strict-JSON text.
 
-        The root value is an array preserving declaration order. Every
+        A directly constructed gate or one loaded from a legacy root
+        array exports the canonical rule array, exactly as before: the
+        root value is an array preserving declaration order. Every
         rule writes its normalized, actually-effective ``id``, ``effect``,
         ``priority``, ``subject``, ``action``, ``resource`` and ``tags``
         in that fixed order, so all defaults appear explicitly and no
@@ -1220,6 +1330,17 @@ class PolicyGate:
         rule set exports as ``[]`` and repeated calls return identical
         text while the rules are unchanged.
 
+        A gate loaded from a versioned envelope (see :meth:`from_json`)
+        instead exports a canonical envelope object with the keys in the
+        fixed order ``version``, ``rules``, ``fingerprint``: ``version``
+        is the loaded document version, ``rules`` is exactly the
+        canonical rule array described above, and ``fingerprint`` is the
+        fingerprint supplied by the input document (or, for an envelope
+        loaded without one, the current snapshot digest). The digest is
+        always the SHA-256 of the canonical *rules* snapshot, never of
+        the enveloped text, so :meth:`fingerprint` agrees across the two
+        document forms.
+
         The result reloads losslessly through :meth:`from_json` with
         identical decide/explain/decide_many/audit behavior. A value that
         cannot be represented losslessly in strict JSON (a tuple, set,
@@ -1228,18 +1349,40 @@ class PolicyGate:
         message carries the fixed tag ``non_json_value``; no partial text
         is returned. Performs no I/O.
         """
-        return _canonical_json(self._snapshot())
+        snapshot = self._snapshot()
+        rules_text = _canonical_json(snapshot)
+        if self.document_version is None:
+            return rules_text
+        # Preserve the input fingerprint verbatim; an envelope loaded
+        # without one is completed with the digest of its rules snapshot,
+        # keeping the exported object self-verifying on reload.
+        fingerprint = self.document_fingerprint
+        if fingerprint is None:
+            fingerprint = hashlib.sha256(rules_text.encode("utf-8")).hexdigest()
+        return _canonical_json(
+            _FixedObject(
+                [
+                    ("version", self.document_version),
+                    ("rules", snapshot),
+                    ("fingerprint", fingerprint),
+                ]
+            )
+        )
 
     def fingerprint(self):
-        """SHA-256 hex digest of the canonical snapshot's UTF-8 bytes.
+        """SHA-256 hex digest of the canonical rules snapshot's UTF-8 bytes.
 
-        Uses exactly the same snapshot as :meth:`to_json`, so digest and
-        text always agree; the result is a 64-character lowercase hex
+        Uses exactly the same rules snapshot as the array form of
+        :meth:`to_json`, so the digest is independent of any versioned
+        envelope and identical rules loaded from either document form
+        always agree; the result is a 64-character lowercase hex
         string. A snapshot that cannot be serialized or UTF-8 encoded
         raises the same ``ValueError`` tagged ``non_json_value``.
         Performs no I/O.
         """
-        return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            _canonical_json(self._snapshot()).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _tags_match(rule, tags):

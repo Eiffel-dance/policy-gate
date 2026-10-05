@@ -462,9 +462,9 @@ class FromJsonTest(unittest.TestCase):
             "duplicate_key",
         )
 
-    def test_root_not_array(self):
-        for bad in ('{"effect": "allow"}', "5", '"str"', "true", "null"):
-            self._expect_code(bad, "root_not_array")
+    def test_root_not_array_or_object(self):
+        for bad in ("5", '"str"', "true", "null"):
+            self._expect_code(bad, "root_not_array_or_object")
 
     def test_rule_not_object_reports_index(self):
         with self.assertRaises(PolicyConfigError) as ctx:
@@ -545,6 +545,515 @@ class FromJsonTest(unittest.TestCase):
         self.assertEqual(
             gate.decide("s", "a", "r"), again.decide("s", "a", "r")
         )
+
+
+class VersionedDocumentTest(unittest.TestCase):
+    RULES = [
+        {"id": "read", "effect": "allow", "action": "read",
+         "resource": "docs/*"},
+        {"effect": "deny", "resource": "secret/*",
+         "tags": {"env": "prod"}},
+        {"id": "num", "effect": "allow", "priority": 5,
+         "subject_exclude": "bot-*",
+         "tag_patterns": {"team": "sec*"},
+         "tag_exclude_patterns": {"env": "tmp*"},
+         "tag_presence": {"tier": True, "ephemeral": False}},
+    ]
+    REQUESTS = [
+        {"subject": "alice", "action": "read", "resource": "docs/a"},
+        {"subject": "alice", "action": "read", "resource": "secret/x",
+         "tags": {"env": "prod", "team": "security", "tier": 1}},
+        {"subject": "bob", "action": "write", "resource": "x",
+         "tags": {"env": "dev"}},
+    ]
+    CASES = [
+        {"subject": "alice", "action": "read", "resource": "docs/a",
+         "expected": {"effect": "allow", "rule": "read"}},
+        {"subject": "bob", "action": "write", "resource": "x",
+         "expected": {"effect": "deny", "rule": None}},
+    ]
+
+    def _legacy(self):
+        return PolicyGate(self.RULES)
+
+    def _envelope_text(self, rules=None, fingerprint=None,
+                       include_fingerprint=False, version=1):
+        import json
+
+        body = {"version": version, "rules": self.RULES if rules is None else rules}
+        if include_fingerprint:
+            body["fingerprint"] = (
+                PolicyGate(self.RULES if rules is None else rules).fingerprint()
+                if fingerprint is None
+                else fingerprint
+            )
+        return json.dumps(body)
+
+    # --- loading -----------------------------------------------------
+
+    def test_loads_versioned_document_with_fingerprint(self):
+        import json
+
+        text = self._envelope_text(include_fingerprint=True)
+        gate = PolicyGate.from_json(text)
+        self.assertEqual(gate.document_version, 1)
+        parsed = json.loads(text)
+        self.assertEqual(gate.fingerprint(), parsed["fingerprint"])
+        legacy = self._legacy()
+        for request in self.REQUESTS:
+            args = (request["subject"], request["action"],
+                    request["resource"], request.get("tags"))
+            self.assertEqual(gate.decide(*args), legacy.decide(*args))
+
+    def test_loads_versioned_document_without_fingerprint(self):
+        gate = PolicyGate.from_json(self._envelope_text())
+        self.assertEqual(gate.document_version, 1)
+        self.assertEqual(gate.fingerprint(), self._legacy().fingerprint())
+        self.assertEqual(
+            gate.decide("alice", "read", "docs/a"),
+            self._legacy().decide("alice", "read", "docs/a"),
+        )
+
+    def test_empty_rules_versioned_document(self):
+        import hashlib
+        import json
+
+        text = json.dumps(
+            {"version": 1, "rules": [],
+             "fingerprint": hashlib.sha256(b"[]").hexdigest()}
+        )
+        gate = PolicyGate.from_json(text)
+        self.assertEqual(gate.document_version, 1)
+        self.assertEqual(gate.rules, [])
+        result = gate.decide("s", "a", "r")
+        self.assertEqual(result["effect"], "deny")
+        self.assertIsNone(result["rule"])
+        self.assertEqual(result["reason"], "default deny")
+
+    def test_legacy_and_direct_construction_have_no_version(self):
+        self.assertIsNone(PolicyGate([]).document_version)
+        legacy = PolicyGate.from_json('[{"effect": "allow"}]')
+        self.assertIsNone(legacy.document_version)
+
+    def test_whitespace_wrapping_is_fine(self):
+        gate = PolicyGate.from_json(
+            "  \n\t " + self._envelope_text(include_fingerprint=True)
+            + " \t\n  "
+        )
+        self.assertEqual(gate.document_version, 1)
+
+    def test_fingerprint_is_over_normalized_snapshot(self):
+        import json
+
+        # Input rule omits defaults (id, priority, selectors, tags); the
+        # fingerprint must be computed over the normalized snapshot.
+        normalized = PolicyGate([{"effect": "allow"}]).to_json()
+        digest = __import__("hashlib").sha256(
+            normalized.encode("utf-8")
+        ).hexdigest()
+        gate = PolicyGate.from_json(
+            json.dumps({"version": 1,
+                        "rules": [{"effect": "allow"}],
+                        "fingerprint": digest})
+        )
+        self.assertEqual(gate.document_version, 1)
+        self.assertEqual(gate.rules[0]["id"], "0")
+        self.assertEqual(gate.rules[0]["priority"], 0)
+
+    # --- export ------------------------------------------------------
+
+    def test_to_json_emits_envelope_in_fixed_order(self):
+        import json
+
+        text = self._envelope_text(include_fingerprint=True)
+        gate = PolicyGate.from_json(text)
+        exported = gate.to_json()
+        parsed = json.loads(exported)
+        self.assertEqual(list(parsed), ["version", "rules", "fingerprint"])
+        self.assertEqual(parsed["version"], 1)
+        self.assertEqual(parsed["fingerprint"], json.loads(text)["fingerprint"])
+        # raw text follows the fixed order too, compact and unescaped
+        self.assertTrue(exported.startswith('{"version":1,"rules":['))
+        self.assertIn(',"fingerprint":"%s"}' % parsed["fingerprint"], exported)
+        self.assertNotIn(", ", exported)
+        self.assertNotIn(": ", exported)
+
+    def test_to_json_preserves_input_fingerprint(self):
+        import json
+
+        digest = self._legacy().fingerprint()
+        text = json.dumps(
+            {"version": 1, "rules": self.RULES, "fingerprint": digest}
+        )
+        gate = PolicyGate.from_json(text)
+        self.assertEqual(
+            json.loads(gate.to_json())["fingerprint"], digest
+        )
+
+    def test_to_json_without_input_fingerprint_is_completed(self):
+        import json
+
+        gate = PolicyGate.from_json(self._envelope_text())
+        parsed = json.loads(gate.to_json())
+        self.assertEqual(set(parsed), {"version", "rules", "fingerprint"})
+        self.assertEqual(parsed["fingerprint"], self._legacy().fingerprint())
+        # the completed envelope is itself self-verifying
+        again = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(again.document_version, 1)
+        self.assertEqual(
+            json.loads(again.to_json())["fingerprint"], parsed["fingerprint"]
+        )
+
+    def test_legacy_forms_still_export_canonical_array(self):
+        self.assertEqual(PolicyGate([]).to_json(), "[]")
+        gate = PolicyGate.from_json('[{"effect": "allow"}]')
+        self.assertEqual(
+            gate.to_json(),
+            '[{"id":"0","effect":"allow","priority":0,'
+            '"subject":"*","action":"*","resource":"*","tags":{}}]',
+        )
+        self.assertEqual(
+            __import__("json").loads(gate.to_json())[0]["id"], "0"
+        )
+
+    def test_fingerprint_is_independent_of_envelope(self):
+        legacy = self._legacy()
+        versioned = PolicyGate.from_json(
+            self._envelope_text(include_fingerprint=True)
+        )
+        self.assertEqual(versioned.fingerprint(), legacy.fingerprint())
+        array_fingerprint = __import__("hashlib").sha256(
+            legacy.to_json().encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(versioned.fingerprint(), array_fingerprint)
+
+    def test_repeated_exports_identical(self):
+        gate = PolicyGate.from_json(
+            self._envelope_text(include_fingerprint=True)
+        )
+        first = gate.to_json()
+        self.assertTrue(all(gate.to_json() == first for _ in range(20)))
+
+    # --- roundtrip parity -------------------------------------------
+
+    def test_roundtrip_preserves_every_behavior(self):
+        legacy = self._legacy()
+        gate = PolicyGate.from_json(
+            self._envelope_text(include_fingerprint=True)
+        )
+        reloaded = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(reloaded.document_version, 1)
+
+        for request in self.REQUESTS:
+            args = (request["subject"], request["action"],
+                    request["resource"], request.get("tags"))
+            self.assertEqual(reloaded.decide(*args), legacy.decide(*args))
+            self.assertEqual(reloaded.explain(*args), legacy.explain(*args))
+            self.assertEqual(reloaded.trace(*args), legacy.trace(*args))
+            self.assertEqual(reloaded.diagnose(*args), legacy.diagnose(*args))
+
+        self.assertEqual(reloaded.decide_many(self.REQUESTS),
+                         legacy.decide_many(self.REQUESTS))
+        self.assertEqual(reloaded.trace_many(self.REQUESTS),
+                         legacy.trace_many(self.REQUESTS))
+        self.assertEqual(reloaded.diagnose_many(self.REQUESTS),
+                         legacy.diagnose_many(self.REQUESTS))
+        self.assertEqual(reloaded.audit(), legacy.audit())
+        self.assertEqual(reloaded.coverage(self.REQUESTS),
+                         legacy.coverage(self.REQUESTS))
+        self.assertEqual(reloaded.verify(self.CASES),
+                         legacy.verify(self.CASES))
+        self.assertEqual(
+            legacy.compare(reloaded, self.REQUESTS)["summary"],
+            {"total": 3, "unchanged": 3, "changed": 0,
+             "allow_to_deny": 0, "deny_to_allow": 0, "winner_changed": 0},
+        )
+        self.assertEqual(
+            reloaded.rule_change_report(legacy),
+            {"added": [], "removed": [], "changed": [],
+             "unchanged": ["read", "1", "num"],
+             "summary": {"baseline_total": 3, "candidate_total": 3,
+                         "added": 0, "removed": 0, "changed": 0,
+                         "unchanged": 3}},
+        )
+        self.assertEqual(reloaded.to_json(), gate.to_json())
+        self.assertEqual(reloaded.fingerprint(), legacy.fingerprint())
+
+    def test_versioned_and_legacy_loads_share_all_semantics(self):
+        legacy = PolicyGate.from_json(__import__("json").dumps(self.RULES))
+        versioned = PolicyGate.from_json(
+            self._envelope_text(include_fingerprint=True)
+        )
+        # identical rules; only the envelope differs
+        self.assertIsNone(legacy.document_version)
+        self.assertEqual(versioned.document_version, 1)
+        for request in self.REQUESTS:
+            args = (request["subject"], request["action"],
+                    request["resource"], request.get("tags"))
+            self.assertEqual(versioned.decide(*args), legacy.decide(*args))
+        self.assertEqual(versioned.audit(), legacy.audit())
+
+    def test_explicit_deny_priority_wildcard_default_deny_unchanged(self):
+        import json
+
+        rules = [
+            {"id": "a", "effect": "allow", "priority": 100},
+            {"id": "d", "effect": "deny", "priority": -5},
+        ]
+        digest = PolicyGate(rules).fingerprint()
+        gate = PolicyGate.from_json(
+            json.dumps({"version": 1, "rules": rules,
+                        "fingerprint": digest})
+        )
+        result = gate.decide("s", "a", "r")
+        self.assertEqual(result["effect"], "deny")
+        self.assertEqual(result["rule"], "d")
+        self.assertIn("overrides allow", result["reason"])
+        self.assertEqual(
+            PolicyGate.from_json(
+                json.dumps({"version": 1, "rules": []})
+            ).decide("s", "a", "r")["reason"],
+            "default deny",
+        )
+
+    # --- structural envelope errors ----------------------------------
+
+    def _expect_code(self, document, code):
+        with self.assertRaises(PolicyConfigError) as ctx:
+            PolicyGate.from_json(document)
+        self.assertEqual(ctx.exception.code, code)
+        self.assertIn(code, str(ctx.exception))
+
+    def _versioned(self, **fields):
+        import json
+
+        return json.dumps(fields)
+
+    def test_root_scalar_is_root_not_array_or_object(self):
+        for bad in ("5", "5.5", '"str"', "true", "false", "null", "-1"):
+            self._expect_code(bad, "root_not_array_or_object")
+
+    def test_unknown_document_field(self):
+        self._expect_code(
+            self._versioned(version=1, rules=[], bogus=1),
+            "unknown_document_field",
+        )
+        # any rule-shaped object without envelope keys is unknown too
+        self._expect_code('{"effect": "allow"}', "unknown_document_field")
+        # an unknown field beats an invalid version
+        self._expect_code(
+            self._versioned(version="1", rules=[], extra=2),
+            "unknown_document_field",
+        )
+
+    def test_missing_version(self):
+        self._expect_code(self._versioned(rules=[]), "missing_version")
+        self._expect_code(
+            self._versioned(rules=[], fingerprint="a" * 64),
+            "missing_version",
+        )
+
+    def test_invalid_version_types(self):
+        for bad in ('"1"', "1.0", "true", "null", '["x"]', '{"x":1}'):
+            self._expect_code(
+                '{"version":%s,"rules":[]}' % bad, "invalid_version"
+            )
+
+    def test_unsupported_version(self):
+        self._expect_code(
+            self._versioned(version=0, rules=[]), "unsupported_version"
+        )
+        self._expect_code(
+            self._versioned(version=2, rules=[]), "unsupported_version"
+        )
+        self._expect_code(
+            self._versioned(version=-1, rules=[]), "unsupported_version"
+        )
+        # version is checked before rules presence/shape
+        self._expect_code('{"version":2}', "unsupported_version")
+
+    def test_missing_rules(self):
+        self._expect_code(self._versioned(version=1), "missing_rules")
+
+    def test_rules_not_array(self):
+        for bad in ("{}", '"x"', "5", "true", "null"):
+            self._expect_code(
+                '{"version":1,"rules":%s}' % bad, "rules_not_array"
+            )
+
+    def test_invalid_fingerprint_shape(self):
+        # wrong length, non-string, uppercase hex, non-hex chars
+        for bad in ('"abc"', "null", "5", "true",
+                    '"%s"' % ("A" * 64), '"%s"' % ("g" * 64),
+                    '"%s"' % ("0" * 63), '"%s0"' % ("0" * 64)):
+            self._expect_code(
+                '{"version":1,"rules":[],'
+                '"fingerprint":%s}' % bad,
+                "invalid_fingerprint",
+            )
+
+    def test_fingerprint_mismatch(self):
+        import hashlib
+
+        digest = hashlib.sha256(b"[]").hexdigest()
+        flipped = ("0" if digest[0] != "0" else "1") + digest[1:]
+        self._expect_code(
+            '{"version":1,"rules":[],"fingerprint":"%s"}' % flipped,
+            "fingerprint_mismatch",
+        )
+
+    def test_error_precedence_first_error_wins(self):
+        # unknown field beats everything below it
+        self._expect_code(
+            self._versioned(version=2, rules="nope", extra=1,
+                            fingerprint="x"),
+            "unknown_document_field",
+        )
+        # missing version beats version/type-independent problems
+        self._expect_code(
+            self._versioned(rules="nope", fingerprint="x"),
+            "missing_version",
+        )
+        # invalid version beats unsupported/rules checks
+        self._expect_code(
+            '{"version":"1","fingerprint":"x"}', "invalid_version"
+        )
+        # unsupported version beats missing rules
+        self._expect_code(
+            self._versioned(version=7, fingerprint="x"),
+            "unsupported_version",
+        )
+        # missing rules beats a malformed fingerprint
+        self._expect_code(
+            '{"version":1,"fingerprint":"x"}', "missing_rules"
+        )
+        # rules type beats fingerprint format
+        self._expect_code(
+            '{"version":1,"rules":{},"fingerprint":"x"}',
+            "rules_not_array",
+        )
+        # fingerprint format beats mismatch comparison
+        self._expect_code(
+            '{"version":1,"rules":[],"fingerprint":"XYZ"}',
+            "invalid_fingerprint",
+        )
+
+    def test_duplicate_key_still_rejected(self):
+        self._expect_code(
+            '{"version":1,"version":2,"rules":[]}', "duplicate_key"
+        )
+        self._expect_code(
+            '{"version":1,"rules":[{"id":"x","id":"y",'
+            '"effect":"allow"}]}',
+            "duplicate_key",
+        )
+
+    def test_invalid_json_still_rejected(self):
+        for bad in ("", "   ", "{", "{,}", "not json",
+                    '{"version":1,"rules":[}', "NaN"):
+            self._expect_code(bad, "invalid_json")
+
+    def test_non_finite_constants_rejected_in_envelope(self):
+        self._expect_code(
+            '{"version":1,"rules":[],"fingerprint":Infinity}',
+            "invalid_json",
+        )
+
+    def test_rule_not_object_inside_envelope(self):
+        with self.assertRaises(PolicyConfigError) as ctx:
+            PolicyGate.from_json(
+                '{"version":1,"rules":[{"effect":"allow"},5]}'
+            )
+        self.assertEqual(ctx.exception.code, "rule_not_object")
+        self.assertIn("rule 1", str(ctx.exception))
+        self._expect_code(
+            '{"version":1,"rules":[[]]}', "rule_not_object"
+        )
+
+    def test_rule_semantic_errors_stay_value_errors(self):
+        for bad_rules in (
+            '[{"id":"x"}]',                              # missing effect
+            '[{"id":3,"effect":"allow"}]',              # bad id type
+            '[{"effect":"allow","priority":1.5}]',      # bad priority
+            '[{"effect":"allow","bogus":1}]',           # unknown rule field
+            '[{"effect":"allow","tags":[]}]',           # bad tags
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                PolicyGate.from_json(
+                    '{"version":1,"rules":%s}' % bad_rules
+                )
+            self.assertNotIsInstance(ctx.exception, PolicyConfigError)
+
+    def test_duplicate_rule_ids_stay_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '{"version":1,"rules":['
+                '{"id":"x","effect":"allow"},'
+                '{"id":"x","effect":"deny"}]}'
+            )
+        self.assertNotIsInstance(ctx.exception, PolicyConfigError)
+
+    def test_semantic_error_names_first_offending_index(self):
+        with self.assertRaises(ValueError) as ctx:
+            PolicyGate.from_json(
+                '{"version":1,"rules":['
+                '{"id":"ok","effect":"allow"},'
+                '{"id":"bad","effect":"allow","priority":"nope"}]}'
+            )
+        self.assertIn("rule 1", str(ctx.exception))
+        self.assertIn("priority", str(ctx.exception))
+
+    # --- read-only / offline ----------------------------------------
+
+    def test_failed_load_leaves_no_instance(self):
+        with self.assertRaises(PolicyConfigError):
+            PolicyGate.from_json('{"version":1}')
+        with self.assertRaises(PolicyConfigError):
+            PolicyGate.from_json(
+                '{"version":1,"rules":[],"fingerprint":"%s"}' % ("a" * 64)
+            )
+        with self.assertRaises(ValueError):
+            PolicyGate.from_json(
+                '{"version":1,"rules":[{"id":"x"}]}'
+            )
+
+    def test_input_text_is_not_mutated(self):
+        document = self._envelope_text(include_fingerprint=True)
+        snapshot = document
+        PolicyGate.from_json(document)
+        self.assertEqual(document, snapshot)
+        self.assertIs(document, snapshot)
+
+    def test_export_does_not_mutate_rules_or_caller_data(self):
+        import copy
+
+        rules = copy.deepcopy(self.RULES)
+        rules_snapshot = copy.deepcopy(rules)
+        gate = PolicyGate.from_json(
+            self._envelope_text(include_fingerprint=True)
+        )
+        caller_tags = {"env": "prod", "team": "sec"}
+        tags_snapshot = copy.deepcopy(caller_tags)
+        for _ in range(3):
+            gate.to_json()
+            gate.fingerprint()
+        gate.decide("s", "read", "x", caller_tags)
+        self.assertEqual(rules, rules_snapshot)
+        self.assertEqual(caller_tags, tags_snapshot)
+        self.assertEqual(
+            [dict(r) for r in gate.rules][0]["id"], "read"
+        )
+
+    def test_snapshot_uses_no_io(self):
+        import inspect
+
+        source = (
+            inspect.getsource(PolicyGate._from_versioned_document)
+            + inspect.getsource(PolicyGate.to_json)
+        )
+        for forbidden in ("open(", "socket", "urllib", "requests",
+                          "subprocess"):
+            self.assertNotIn(forbidden, source)
 
 
 class AuditTest(unittest.TestCase):
