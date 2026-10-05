@@ -19,6 +19,15 @@ Tests: python3 -m unittest discover -s tests -v
 - 相同 effect 的部分重叠不算冲突。每条 finding 固定含 `code`、`severity`、`rule`、`other_rule`、`winner`、`shadowed`、`reason`、`witness`；无法完全遮蔽时 `shadowed` 为 `None`。无重叠选择器时返回空报告。
 - `witness` 是一个确实能触发该 finding 的最小见证请求，固定含 `subject`、`action`、`resource`、`tags` 四个键：把它交回 `decide`/`explain` 必然同时命中该对规则（`effect_overlap` 下 deny 必然最终生效）。三个字符串字段各自独立地取所有同时匹配两条规则 `fnmatch.fnmatchcase` 模式的字符串中最短者，长度相同取 Unicode 码点字典序最小者，允许空字符串；`tags` 只合并两条规则的标签约束（共享键值在产生 finding 时必相同，互不冲突的键全部保留，键按 Unicode 码点顺序输出，不凭空添加标签）。直接构造与 `from_json` 得到的相同规则生成完全相同的 witness，重复调用返回相等结果，修改返回的报告不影响后续调用。
 
+## 单条规则可达性审计
+
+`PolicyGate.audit()` 在成对检查之前，先按声明顺序对每条规则单独做可达性检查，找出任何合法请求都不可能命中的规则；检查保持离线、只读、确定性，不改变现有决策、解释、快照及成对审计语义。
+
+- `subject`、`action`、`resource` 的正向模式必须至少匹配一个字符串；声明了对应 `subject_exclude`、`action_exclude`、`resource_exclude` 时，还须存在匹配正向模式且不命中排除模式的字符串，匹配严格沿用 `fnmatch.fnmatchcase` 语义。`tag_patterns` 的每个模式也须有可匹配字符串；精确 `tags`、`tag_presence` 与 `tag_exclude_patterns` 沿用现有规则（仅被排除模式约束的标签键可以缺席），不单独造成不可达。
+- 任一维度或标签模式无法满足即认定该规则不可达，产生一条 `unsatisfiable_rule`（error）finding；字段固定为 `code`、`severity`、`rule`、`other_rule`、`winner`、`shadowed`、`reason`、`witness`，其中 `rule` 为该规则 id，`other_rule`、`winner`、`shadowed`、`witness` 均为 `None`。每条规则至多一条 finding，多个失败原因只报告首个：按 `subject`、`action`、`resource`、`tag_patterns` 键的 Unicode 顺序（即 `action`、`resource`、`subject`、`tag_patterns`）确定；`reason` 指出首个失败字段，并区分“正向模式没有任何匹配值”与“所有匹配值都被排除模式吞掉”两种情况。
+- 单规则 finding 按声明顺序排在既有成对 finding 之前，`summary` 的 `total`、`error`、`warning` 一并计入；没有不可达规则时，审计报告的字段、顺序与结果与旧版完全一致。
+- 直接构造与 `from_json` 加载的等价规则报告相同；重复调用返回相等结果，修改返回的报告不影响后续调用，全程无外部 I/O。
+
 ## 可复核策略快照
 
 `PolicyGate.to_json()` 把已加载规则导出为规范的严格 JSON 文本，供发布前离线比较；`fingerprint()` 返回同一快照 UTF-8 字节的 SHA-256 小写十六进制摘要（固定 64 字符）。
