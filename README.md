@@ -127,4 +127,14 @@ Tests: python3 -m unittest discover -s tests -v
 - `audit` 把排除模式纳入重叠、`shadowed_rule`、`effect_overlap` 与选择器相同性判断：只有存在同时满足双方正向模式且避开双方排除模式的主体/动作/资源字符串时才报告 finding；任一维度无可满足字符串就不生成 finding。`witness` 的三个字符串字段各自独立地取满足上述条件的最短字符串，长度相同按 Unicode 码点字典序取小，交回 `decide`/`explain` 仍同时命中两条规则；重复审计结果稳定，修改返回报告不影响后续调用。
 - `to_json` 在规则使用这些字段时按 `subject_exclude`、`action_exclude`、`resource_exclude` 的固定顺序紧跟 `resource` 导出（仅导出实际提供的字段，显式空字符串照常写出），`fingerprint` 随其变化；完全未使用新字段的规则，其判定、审计结果、`to_json` 字节和 `fingerprint` 保持既有结果。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
 
+## 规则说明文字
+
+规则可携带可选的 `description` 字符串字段，为命中的规则提供面向审查者的稳定说明；说明只用于展示，不参与任何判定。
+
+- `description` 必须是字符串，允许空字符串；省略时规则与旧规则完全相同。非字符串在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_description` 并标明规则索引与字段名，不会延迟到 `decide`；未知字段与其他配置错误的检查顺序保持不变。
+- 说明不参与 `fnmatch` 匹配、标签约束、显式 deny、priority、声明顺序或默认 deny：`decide`、`decide_many`、`trace`、`diagnose`、`coverage`、`compare`、`verify` 和 `audit` 的结果、异常边界与只读性完全沿用既有定义。
+- `explain` 返回的 `matched_rules` 中，仅实际提供 `description` 的规则增加同名键（空字符串照常写出），没有说明的规则保持原有返回结构；返回值可安全修改而不影响 gate。
+- `to_json` 在规则提供 `description` 时把它写在 `resource` 之后、选择器排除字段与 `tags` 之前，`fingerprint` 随说明文字变化；省略该字段的规则继续产生原来的 JSON 字节。经 `from_json` 往返后决定、审计与快照完全一致，重复调用、直接构造与 `from_json` 构造得到相同说明。
+- `rule_change_report` 对同一 id 的说明变化把 `description` 列入 `changed.fields`（固定字段顺序中位于 `resource` 之后），`before`/`after` 各自给出独立快照副本；新增或移除规则的快照同样保留该字段。
+
 
