@@ -17,6 +17,7 @@ _ALLOWED_FIELDS = frozenset(
         "subject_exclude",
         "action_exclude",
         "resource_exclude",
+        "description",
         "tags",
         "tag_patterns",
         "tag_exclude_patterns",
@@ -1024,6 +1025,12 @@ class PolicyGate:
                         "must be a string when provided" % (i, field)
                     )
 
+            if "description" in r and not isinstance(r["description"], str):
+                raise ValueError(
+                    "invalid_description: rule %d: field 'description' "
+                    "must be a string when provided" % i
+                )
+
             tags = r.get("tags", {})
             if not isinstance(tags, dict) or not all(
                 isinstance(k, str) for k in tags
@@ -1139,6 +1146,7 @@ class PolicyGate:
                     "subject_exclude": r.get("subject_exclude"),
                     "action_exclude": r.get("action_exclude"),
                     "resource_exclude": r.get("resource_exclude"),
+                    "description": r.get("description"),
                     "tags": tags,
                     "tag_patterns": tag_patterns,
                     "tag_exclude_patterns": tag_exclude_patterns,
@@ -1318,9 +1326,13 @@ class PolicyGate:
         """One rule's normalized snapshot as a fixed-order ``_FixedObject``.
 
         Only the effective fields are emitted, in fixed order, so the
-        internal ``_index`` never leaks; each provided selector
+        internal ``_index`` never leaks; a provided ``description``
+        (stored as ``None`` when omitted, and never written then, while
+        an explicitly provided empty string is) is emitted immediately
+        after ``resource``; each provided selector
         exclusion is emitted in its fixed order immediately after
-        ``resource`` (an omitted field, stored as ``None``, is never
+        ``resource``/``description`` (an omitted field, stored as
+        ``None``, is never
         written, while an explicitly provided empty string is), then
         ``tags``, followed by non-empty ``tag_patterns``,
         ``tag_exclude_patterns`` and ``tag_presence`` mappings in that
@@ -1328,6 +1340,8 @@ class PolicyGate:
         :meth:`rule_change_report` so both views always agree.
         """
         pairs = [(field, rule[field]) for field in self._SNAPSHOT_FIELDS]
+        if rule["description"] is not None:
+            pairs.append(("description", rule["description"]))
         for field in _EXCLUSION_FIELDS:
             if rule[field] is not None:
                 pairs.append((field, rule[field]))
@@ -1384,9 +1398,13 @@ class PolicyGate:
         rule writes its normalized, actually-effective ``id``, ``effect``,
         ``priority``, ``subject``, ``action``, ``resource`` and ``tags``
         in that fixed order, so all defaults appear explicitly and no
-        internal index leaks; each provided ``subject_exclude``,
+        internal index leaks; a provided ``description`` is written
+        immediately after ``resource`` (an omitted field is never
+        written, an explicitly provided empty string is); each provided
+        ``subject_exclude``,
         ``action_exclude`` and ``resource_exclude`` is written in that
-        fixed field order immediately after ``resource`` (an omitted
+        fixed field order immediately after ``resource`` (and
+        ``description`` when present) (an omitted
         field is never written, an explicitly provided empty string is),
         a rule with a non-empty ``tag_patterns``
         mapping writes it in the same fixed order immediately after
@@ -1394,7 +1412,8 @@ class PolicyGate:
         mapping writes it immediately after that, and a rule with a
         non-empty ``tag_presence`` mapping writes it immediately after
         that, while rules without
-        pattern or presence constraints export exactly the same bytes
+        a description or pattern or presence constraints export exactly
+        the same bytes
         as before. Tag objects (at every nesting level)
         have their keys sorted by Unicode code point; separators are
         compact and non-ASCII characters are emitted unescaped. An empty
@@ -1980,7 +1999,8 @@ class PolicyGate:
           their declaration positions, and ``fields`` names the changed
           fields in the fixed order
           ``effect``, ``priority``, ``subject``, ``action``,
-          ``resource``, ``subject_exclude``, ``action_exclude``,
+          ``resource``, ``description``, ``subject_exclude``,
+          ``action_exclude``,
           ``resource_exclude``, ``tags``, ``tag_patterns``,
           ``tag_exclude_patterns``, ``tag_presence``, plus
           ``declaration_order`` when only (or also) the rule's position
@@ -1988,8 +2008,9 @@ class PolicyGate:
           therefore still reported as changed with
           ``fields == ["declaration_order"]``. Selector-exclusion
           differences compare the normalized field (``None`` when
-          omitted), and tag constraints compare their normalized
-          mappings.
+          omitted), ``description`` likewise compares the normalized
+          field (``None`` when omitted), and tag constraints compare
+          their normalized mappings.
 
         ``summary`` holds the fixed keys ``baseline_total``,
         ``candidate_total``, ``added``, ``removed``, ``changed`` and
@@ -2046,6 +2067,7 @@ class PolicyGate:
             ("subject", "subject"),
             ("action", "action"),
             ("resource", "resource"),
+            ("description", "description"),
             ("subject_exclude", "subject_exclude"),
             ("action_exclude", "action_exclude"),
             ("resource_exclude", "resource_exclude"),
@@ -2107,14 +2129,25 @@ class PolicyGate:
 
         Shares decide()'s validation and selection semantics; adds
         matched_rules, every actually matched rule in declaration order.
-        Does not mutate the rule list or touch any external state.
+        A matched rule that declares a ``description`` carries it under
+        the same key (an immutable string, so the returned entry can
+        never alias mutable gate state); rules without one keep the
+        original ``id``/``effect``/``priority`` shape. Does not mutate
+        the rule list or touch any external state.
         """
         result, matched = self._evaluate(subject, action, resource, tags)
         explanation = dict(result)
-        explanation["matched_rules"] = [
-            {"id": r["id"], "effect": r["effect"], "priority": r["priority"]}
-            for r in matched
-        ]
+        matched_rules = []
+        for r in matched:
+            entry = {
+                "id": r["id"],
+                "effect": r["effect"],
+                "priority": r["priority"],
+            }
+            if r["description"] is not None:
+                entry["description"] = r["description"]
+            matched_rules.append(entry)
+        explanation["matched_rules"] = matched_rules
         return explanation
 
     def trace(self, subject, action, resource, tags=None):

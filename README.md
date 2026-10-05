@@ -127,4 +127,14 @@ Tests: python3 -m unittest discover -s tests -v
 - `audit` 把排除模式纳入重叠、`shadowed_rule`、`effect_overlap` 与选择器相同性判断：只有存在同时满足双方正向模式且避开双方排除模式的主体/动作/资源字符串时才报告 finding；任一维度无可满足字符串就不生成 finding。`witness` 的三个字符串字段各自独立地取满足上述条件的最短字符串，长度相同按 Unicode 码点字典序取小，交回 `decide`/`explain` 仍同时命中两条规则；重复审计结果稳定，修改返回报告不影响后续调用。
 - `to_json` 在规则使用这些字段时按 `subject_exclude`、`action_exclude`、`resource_exclude` 的固定顺序紧跟 `resource` 导出（仅导出实际提供的字段，显式空字符串照常写出），`fingerprint` 随其变化；完全未使用新字段的规则，其判定、审计结果、`to_json` 字节和 `fingerprint` 保持既有结果。经 `from_json` 往返后所有公开方法给出相同结果，功能继续无网络、无外部 I/O。
 
+## 规则说明文字
+
+规则可携带可选的 `description` 字符串字段，为审查者提供稳定的命中说明；它只用于展示，不参与任何判定语义，不改变既有规则和返回结构。
+
+- `description` 必须是字符串，允许空字符串；省略该字段时规则与旧规则完全相同。非字符串在 `PolicyGate` 构造和 `from_json` 加载阶段统一抛出 `ValueError`，消息前缀固定为 `invalid_description` 并带规则索引与字段名，不会延迟到 `decide`；未知字段与其他既有配置错误的检查顺序保持不变。
+- `to_json` 在规则提供 `description` 时把它固定在 `resource` 之后、选择器排除字段和 `tags` 之前导出（显式空字符串照常写出），`fingerprint` 随说明文字变化；省略该字段的规则继续产生原来的 JSON 字节。`from_json(to_json())` 往返后 `decide`、审计与快照结果逐值相同。
+- `rule_change_report` 对同一 id 的说明文字变化把 `description` 列入 `changed.fields`（固定顺序中位于 `resource` 之后），`before`/`after` 分别给出独立副本；新增或移除规则的快照同样保留该字段。
+- `explain` 的 `matched_rules` 中，只有实际提供 `description` 的规则增加同名键（字符串不可变，修改返回结构不会影响 gate）；没有说明的规则沿用原有的 `id`/`effect`/`priority` 结构。
+- `description` 不参与 fnmatch 匹配、标签约束、显式 deny、priority、声明顺序或默认 deny：`decide`、`decide_many`、`trace`、`diagnose`、`coverage`、`compare`、`verify`、`audit` 的既有结果、异常边界、只读性与无网络行为保持不变；重复调用、直接构造与 `from_json` 构造得到相同的说明结果。
+
 
