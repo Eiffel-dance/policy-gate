@@ -2142,6 +2142,56 @@ class PolicyGate:
         result["evaluations"] = evaluations
         return result
 
+    def diagnose_many(self, requests):
+        """Batch counterpart of :meth:`diagnose`, for pre-release review.
+
+        ``requests`` uses the same list/tuple of request mappings as
+        :meth:`decide_many` and is validated exactly the same way: the
+        whole batch is checked first, and the first malformed element
+        raises :class:`PolicyBatchError` with its ``code``/``index``/
+        ``field`` instead of producing partial results.
+
+        Returns ``{"diagnoses": [...], "summary": {"total", "allow",
+        "deny", "default_deny", "matched_request"}}`` with one
+        :meth:`diagnose` result per request in input order, each
+        identical (``effect``, ``rule``, ``reason`` and the
+        declaration-order ``evaluations`` covering every rule) to
+        calling :meth:`diagnose` with the same arguments, including the
+        failure classifications, tag constraints, selector exclusions,
+        explicit deny, priority, declaration order and default-deny
+        semantics. The summary counts the request total, final allows,
+        final denies, requests that matched no rule (and so fell through
+        to the default deny), and requests matching at least one rule. An
+        empty batch yields all-zero counts; with an empty rule set every
+        request lands in ``default_deny``.
+
+        Read-only and offline: rules and caller mappings are never
+        modified, no I/O happens, repeated calls return equal results,
+        every returned mapping (and its nested objects) is independent
+        of the rules and of later calls, and gates built directly and via
+        :meth:`from_json` diagnose identically.
+        """
+        self._validate_requests(requests)
+
+        diagnoses = [
+            self.diagnose(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            for item in requests
+        ]
+        default_deny = sum(1 for d in diagnoses if d["rule"] is None)
+        summary = {
+            "total": len(diagnoses),
+            "allow": sum(1 for d in diagnoses if d["effect"] == "allow"),
+            "deny": sum(1 for d in diagnoses if d["effect"] == "deny"),
+            "default_deny": default_deny,
+            "matched_request": len(diagnoses) - default_deny,
+        }
+        return {"diagnoses": diagnoses, "summary": summary}
+
     def trace_many(self, requests):
         """Batch counterpart of :meth:`trace`.
 

@@ -67,6 +67,15 @@ Tests: python3 -m unittest discover -s tests -v
 - `trace_many` 的 `requests` 沿用 `decide_many` 的边界，整批先校验，首个错误抛原有 `PolicyBatchError`（带 `code`、`index`、`field`），不返回部分结果；成功返回 `{"traces": [...], "summary": {"total", "allow", "deny"}}`，`traces` 按输入顺序排列，计数与 `decide_many` 相同，空批次为全零。
 - 两个入口只读、纯离线：不修改规则或调用方映射，无网络和其他 I/O；直接构造和 `from_json` 加载的规则具有相同追踪语义，且不影响 `decide`、`decide_many`、`explain`、`audit`、`coverage`、`compare`、`from_json`、`to_json`、`fingerprint` 的既有行为。
 
+## 发布前批量逐规则诊断
+
+`PolicyGate.diagnose(subject, action, resource, tags=None)` 在保留 `decide` 判定结果的基础上，对每条规则给出逐项匹配细节并对未命中规则标注首个失败原因；`PolicyGate.diagnose_many(requests)` 用于发布前批量审阅。
+
+- 单项 `diagnose` 的输入校验与 `decide` 完全一致（非法类型抛同样的 `TypeError`，`tags=None` 视为空映射）；根级 `effect`、`rule`、`reason` 与 `decide` 结果逐项相等，`evaluations` 按声明顺序覆盖全部规则，每项按固定顺序含 `id`、`effect`、`priority`、`subject_match`、`action_match`、`resource_match`、`tags_match`、`matched`、`selected`、`failure`；四个匹配标志、`matched`、`selected` 与 `trace` 完全一致。`failure` 在命中规则上为 `null`，否则按固定顺序给出首个失败检查：字符串维度为 `selector_mismatch` / `selector_excluded`（`key` 为 `null`），标签约束按精确、模式、排除、存在性顺序给出 `tag_exact_mismatch`、`tag_pattern_inapplicable`、`tag_pattern_mismatch`、`tag_excluded`、`tag_presence_missing`、`tag_presence_forbidden`（键按 Unicode 码点顺序访问）。显式 deny、priority、声明顺序与默认 deny 沿用单项语义。
+- `diagnose_many` 的 `requests` 只接受 list 或 tuple，每项是仅含 `subject`、`action`、`resource`、`tags` 的映射；前三项为必填字符串，`tags` 可省略、为 `None` 或 mapping。整批先按 `decide_many` 的既有边界完整校验，首个错误抛原有 `PolicyBatchError`（沿用 `invalid_batch`、`item_not_mapping`、`unknown_field`、`missing_field`、`invalid_field_type` 及 `index`、`field`），失败时不返回部分结果。
+- 成功后按输入顺序返回 `{"diagnoses": [...], "summary": {"total", "allow", "deny", "default_deny", "matched_request"}}`：每个 diagnosis 与相同参数调用 `diagnose` 完全一致；`summary` 的 `total`、`allow`、`deny` 含义与 `decide_many` 相同，`default_deny` 为无规则命中而默认拒绝的请求数，`matched_request` 为至少命中一条规则的请求数。空批次全部为零；空规则集所有请求计入 `default_deny`。
+- 两个入口只读、纯离线：不修改规则、输入映射或既有结果，无网络和其他 I/O；返回值及嵌套对象相互独立，修改后不影响后续调用，重复调用逐值相等，直接构造与 `from_json` 加载的同一规则结果相同；不改变 `decide`、`decide_many`、`trace`、`trace_many`、`verify`、`coverage`、`compare`、`rule_change_report`、`audit`、`to_json`、`fingerprint`、`from_json` 的字段、序列化和异常边界。
+
 ## 发布前固定用例核验
 
 `PolicyGate.verify(cases)` 在发布前按一组固定用例核对规则的最终决策，纯离线、只读，不改变规则或输入。
