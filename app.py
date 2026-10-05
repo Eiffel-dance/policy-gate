@@ -822,6 +822,74 @@ def _patterns_overlap(t1, t2):
     return bool(row[0])
 
 
+def _unsatisfiable_finding(rule, reason):
+    """The fixed-shape finding for one unreachable rule."""
+    return {
+        "code": "unsatisfiable_rule",
+        "severity": "error",
+        "rule": rule["id"],
+        "other_rule": None,
+        "winner": None,
+        "shadowed": None,
+        "reason": reason,
+        "witness": None,
+    }
+
+
+def _audit_rule(rule, compiled):
+    """Build the unsatisfiable-rule finding for one rule, or None.
+
+    A rule is unreachable when no request can ever match it. Each
+    string dimension needs at least one string matching its positive
+    pattern; when the dimension declares an exclusion, some string must
+    match the positive pattern without hitting the exclusion pattern.
+    Every ``tag_patterns`` pattern likewise needs at least one matching
+    string. Exact ``tags``, ``tag_presence`` and
+    ``tag_exclude_patterns`` can always be satisfied on their own — a
+    forbidden or exclusion-only key simply stays absent — so they never
+    make a rule unreachable. Only the first failing field is reported;
+    fields are probed in the Unicode code-point order of their names
+    (action, resource, subject, tag_patterns), and within
+    ``tag_patterns`` the keys are probed in Unicode code-point order.
+    """
+    for field, positive, negative in (
+        ("action", compiled[1], compiled[4]),
+        ("resource", compiled[2], compiled[5]),
+        ("subject", compiled[0], compiled[3]),
+    ):
+        if not _pattern_satisfiable(positive):
+            reason = (
+                "rule %r can never match: no string matches the %s "
+                "pattern %r" % (rule["id"], field, rule[field])
+            )
+        elif negative is not None and (
+            _min_string_avoiding([positive], [negative]) is None
+        ):
+            reason = (
+                "rule %r can never match: every string matching the %s "
+                "pattern %r is excluded by %s %r"
+                % (
+                    rule["id"],
+                    field,
+                    rule[field],
+                    field + "_exclude",
+                    rule[field + "_exclude"],
+                )
+            )
+        else:
+            continue
+        return _unsatisfiable_finding(rule, reason)
+    for key in sorted(rule["tag_patterns"]):
+        if not _pattern_satisfiable(compiled[6][key]):
+            return _unsatisfiable_finding(
+                rule,
+                "rule %r can never match: no string matches the "
+                "tag_patterns pattern %r for key %r"
+                % (rule["id"], rule["tag_patterns"][key], key),
+            )
+    return None
+
+
 def _audit_pair(r1, r2, c1, c2):
     """Build the finding for one rule pair, or None when there is none."""
     dimensions = []
@@ -2369,7 +2437,28 @@ class PolicyGate:
         list; it only analyzes the rules that loaded successfully, so
         decide()/explain()/decide_many() results are unaffected.
 
-        Every pair of rules is checked in declaration order. Two
+        Each rule is first checked on its own, in declaration order,
+        for reachability: a rule no legal request can ever match yields
+        one ``unsatisfiable_rule`` error finding whose ``rule`` is that
+        rule's id and whose ``other_rule``, ``winner``, ``shadowed``
+        and ``witness`` are all None. A rule is unreachable when some
+        string dimension's positive pattern matches no string at all,
+        when a declared ``subject_exclude`` / ``action_exclude`` /
+        ``resource_exclude`` excludes every string the corresponding
+        positive pattern matches, or when one of its ``tag_patterns``
+        patterns matches no string; exact ``tags``, ``tag_presence``
+        and ``tag_exclude_patterns`` constraints can always be
+        satisfied (an exclusion-constrained key may simply stay
+        absent), so they never make a rule unreachable on their own.
+        The ``reason`` names the first failing field — fields are
+        probed in the Unicode code-point order of the names
+        ``subject``, ``action``, ``resource`` and ``tag_patterns``
+        (that is, action, resource, subject, tag_patterns) — and
+        distinguishes a positive pattern with no matching string from
+        an exclusion that removes every matching string. A rule with
+        several problems is reported only once.
+
+        Every pair of rules is then checked in declaration order. Two
         selectors overlap when some subject/action/resource string
         matches both glob patterns under fnmatch.fnmatchcase semantics
         while matching neither rule's ``subject_exclude`` /
@@ -2401,11 +2490,15 @@ class PolicyGate:
         Returns ``{"findings": [...], "summary": {"total", "error",
         "warning"}}``. Each finding has the fixed keys ``code``,
         ``severity``, ``rule``, ``other_rule``, ``winner``, ``shadowed``,
-        ``reason`` and ``witness``; ``rule``/``other_rule`` are the
+        ``reason`` and ``witness``. Single-rule ``unsatisfiable_rule``
+        findings come first, in declaration order, followed by the pair
+        findings; for pair findings ``rule``/``other_rule`` are the
         earlier/later declared rule ids and ``shadowed`` is None when no
-        rule is fully shadowed. Findings are stably ordered by declaration
-        position with at most one finding per pair. With no overlapping
-        selectors the report is empty and every summary count is 0.
+        rule is fully shadowed. Pair findings are stably ordered by
+        declaration position with at most one finding per pair. With no
+        unsatisfiable rule and no overlapping selectors the report is
+        empty and every summary count is 0; with no unsatisfiable rule
+        the report is exactly what the pair-only audit produced.
 
         ``witness`` is a concrete request that actually triggers the
         finding, with exactly the keys ``subject``, ``action``,
@@ -2464,6 +2557,10 @@ class PolicyGate:
             for r in self.rules
         ]
         findings = []
+        for index, rule in enumerate(self.rules):
+            finding = _audit_rule(rule, compiled[index])
+            if finding is not None:
+                findings.append(finding)
         for earlier in range(len(self.rules)):
             for later in range(earlier + 1, len(self.rules)):
                 finding = _audit_pair(

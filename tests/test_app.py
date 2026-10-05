@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from app import PolicyBatchError, PolicyConfigError, PolicyGate, PolicyVerificationError
@@ -842,7 +843,6 @@ class AuditTest(unittest.TestCase):
             ("a*", "b*"),
             ("[!a]", "a"),
             ("prod/?", "prod/xy"),
-            ("[z-a]", "*"),  # empty range never matches anything
         ]
         for first, second in disjoint_pairs:
             gate = PolicyGate(
@@ -1061,6 +1061,231 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(finding["rule"], "read")
         self.assertEqual(finding["other_rule"], "1")
         self.assertEqual(finding["winner"], "1")
+
+
+class UnsatisfiableRuleAuditTest(unittest.TestCase):
+    def test_no_positive_match_on_each_dimension(self):
+        for field in ("subject", "action", "resource"):
+            gate = PolicyGate(
+                [{"id": "bad", "effect": "allow", field: "[z-a]"}]
+            )
+            report = gate.audit()
+            self.assertEqual(
+                report["summary"], {"total": 1, "error": 1, "warning": 0}
+            )
+            (finding,) = report["findings"]
+            self.assertEqual(
+                finding,
+                {
+                    "code": "unsatisfiable_rule",
+                    "severity": "error",
+                    "rule": "bad",
+                    "other_rule": None,
+                    "winner": None,
+                    "shadowed": None,
+                    "reason": finding["reason"],
+                    "witness": None,
+                },
+            )
+            self.assertIn(field, finding["reason"])
+            self.assertIn("no string matches", finding["reason"])
+
+    def test_exclusion_covering_every_match(self):
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "deny", "subject": "tmp-*",
+                 "subject_exclude": "*"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "unsatisfiable_rule")
+        self.assertEqual(finding["severity"], "error")
+        self.assertIn("subject", finding["reason"])
+        self.assertIn("excluded", finding["reason"])
+        self.assertNotIn("no string matches", finding["reason"])
+
+    def test_positive_failure_reported_before_exclusion(self):
+        # the positive pattern matches nothing at all, so the reason
+        # reports the missing positive value even though an exclusion
+        # is also declared
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow", "action": "[z-a]",
+                 "action_exclude": "*"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertIn("no string matches", finding["reason"])
+        self.assertNotIn("excluded", finding["reason"])
+
+    def test_first_failing_field_follows_unicode_order(self):
+        # action < resource < subject < tag_patterns
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow",
+                 "subject": "[z-a]", "action": "[z-a]",
+                 "resource": "[z-a]",
+                 "tag_patterns": {"env": "[z-a]"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertIn("action", finding["reason"])
+
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow",
+                 "subject": "[z-a]", "resource": "[z-a]",
+                 "tag_patterns": {"env": "[z-a]"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertIn("resource", finding["reason"])
+
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow",
+                 "subject": "[z-a]", "tag_patterns": {"env": "[z-a]"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertIn("subject", finding["reason"])
+
+        gate = PolicyGate(
+            [{"id": "bad", "effect": "allow",
+              "tag_patterns": {"env": "[z-a]"}}]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertIn("tag_patterns", finding["reason"])
+
+    def test_tag_patterns_first_key_follows_unicode_order(self):
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow",
+                 "tag_patterns": {"zeta": "[z-a]", "alpha": "[z-a]"}},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "unsatisfiable_rule")
+        self.assertIn("tag_patterns", finding["reason"])
+        self.assertIn("alpha", finding["reason"])
+        self.assertNotIn("zeta", finding["reason"])
+
+    def test_multiple_problems_reported_once(self):
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow",
+                 "subject": "[z-a]", "action": "[z-a]",
+                 "tag_patterns": {"env": "[z-a]", "stage": "[z-a]"}},
+            ]
+        )
+        self.assertEqual(len(gate.audit()["findings"]), 1)
+
+    def test_exact_tags_presence_and_tag_exclusions_stay_reachable(self):
+        # exact values can be supplied, presence keys can be present or
+        # absent, and an exclusion-constrained key may simply stay absent
+        gate = PolicyGate(
+            [
+                {"id": "ok", "effect": "allow",
+                 "tags": {"env": "prod"},
+                 "tag_presence": {"team": True, "tmp": False},
+                 "tag_exclude_patterns": {"stage": "*"}},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_empty_string_exclusion_keeps_rule_reachable(self):
+        gate = PolicyGate(
+            [{"id": "ok", "effect": "allow", "subject_exclude": ""}]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_unsatisfiable_exclusion_pattern_excludes_nothing(self):
+        gate = PolicyGate(
+            [
+                {"id": "ok", "effect": "allow", "resource": "data/*",
+                 "resource_exclude": "[z-a]"},
+            ]
+        )
+        self.assertEqual(gate.audit()["findings"], [])
+
+    def test_findings_precede_pair_findings_in_declaration_order(self):
+        gate = PolicyGate(
+            [
+                {"id": "a", "effect": "allow", "action": "read"},
+                {"id": "bad1", "effect": "allow", "subject": "[z-a]"},
+                {"id": "d", "effect": "deny", "action": "r*"},
+                {"id": "bad2", "effect": "deny",
+                 "tag_patterns": {"e": "[z-a]"}},
+            ]
+        )
+        report = gate.audit()
+        kinds = [(f["code"], f["rule"]) for f in report["findings"]]
+        self.assertEqual(
+            kinds,
+            [
+                ("unsatisfiable_rule", "bad1"),
+                ("unsatisfiable_rule", "bad2"),
+                ("effect_overlap", "a"),
+            ],
+        )
+        self.assertEqual(
+            report["summary"],
+            {"total": 3, "error": 3, "warning": 0},
+        )
+
+    def test_unsatisfiable_rule_produces_no_pair_finding(self):
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow", "subject": "[z-a]"},
+                {"id": "d", "effect": "deny"},
+            ]
+        )
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "unsatisfiable_rule")
+
+    def test_from_json_matches_direct_construction(self):
+        rules = [
+            {"id": "bad", "effect": "allow", "subject": "[z-a]"},
+            {"id": "ok", "effect": "deny", "action": "read"},
+        ]
+        gate = PolicyGate(rules)
+        loaded = PolicyGate.from_json(json.dumps(rules))
+        self.assertEqual(gate.audit(), loaded.audit())
+        versioned = PolicyGate.from_json(
+            json.dumps({"version": 1, "rules": rules})
+        )
+        self.assertEqual(gate.audit(), versioned.audit())
+
+    def test_repeated_calls_equal_and_mutation_isolated(self):
+        gate = PolicyGate(
+            [{"id": "bad", "effect": "allow", "subject": "[z-a]"}]
+        )
+        first = gate.audit()
+        for _ in range(5):
+            self.assertEqual(gate.audit(), first)
+        first["findings"][0]["rule"] = "tampered"
+        first["findings"][0]["reason"] = "tampered"
+        first["summary"]["error"] = 99
+        fresh = gate.audit()
+        self.assertEqual(fresh["findings"][0]["rule"], "bad")
+        self.assertNotEqual(fresh["findings"][0]["reason"], "tampered")
+        self.assertEqual(fresh["summary"]["error"], 1)
+
+    def test_audit_with_unsatisfiable_rule_is_read_only(self):
+        gate = PolicyGate(
+            [
+                {"id": "bad", "effect": "allow", "subject": "[z-a]"},
+                {"id": "ok", "effect": "allow", "action": "read"},
+            ]
+        )
+        before = [dict(r) for r in gate.rules]
+        decision_before = gate.decide("s", "read", "r")
+        gate.audit()
+        gate.audit()
+        self.assertEqual(gate.rules, before)
+        self.assertEqual(gate.decide("s", "read", "r"), decision_before)
+        # the unreachable rule indeed never wins a decision
+        self.assertEqual(decision_before["rule"], "ok")
 
 
 class WitnessTest(unittest.TestCase):
@@ -1361,6 +1586,20 @@ class WitnessTest(unittest.TestCase):
                 {"effect": "deny", "resource": second},
             )
             findings = gate.audit()["findings"]
+            unsatisfiable = [
+                rid
+                for rid, pattern in (("r1", first), ("r2", second))
+                if not _pattern_satisfiable(pattern)
+            ]
+            single = [
+                f for f in findings if f["code"] == "unsatisfiable_rule"
+            ]
+            self.assertEqual(
+                [f["rule"] for f in single], unsatisfiable, (first, second)
+            )
+            findings = [
+                f for f in findings if f["code"] != "unsatisfiable_rule"
+            ]
             witness = _min_common_from_patterns(first, second)
             if witness is None:
                 self.assertEqual(findings, [], (first, second))
@@ -1417,11 +1656,8 @@ class WitnessTest(unittest.TestCase):
             by_id = {r["id"]: r for r in gate.rules}
             report = gate.audit()
             seen_pairs = set()
+            seen_pair_finding = False
             for finding in report["findings"]:
-                pair = (finding["rule"], finding["other_rule"])
-                self.assertEqual(len(pair), len(set(pair)))
-                self.assertNotIn(pair, seen_pairs)
-                seen_pairs.add(pair)
                 self.assertEqual(
                     set(finding),
                     {
@@ -1429,6 +1665,22 @@ class WitnessTest(unittest.TestCase):
                         "shadowed", "reason", "witness",
                     },
                 )
+                if finding["code"] == "unsatisfiable_rule":
+                    # single-rule findings carry no pair data or witness
+                    # and always precede every pair finding
+                    self.assertFalse(seen_pair_finding)
+                    self.assertEqual(finding["severity"], "error")
+                    self.assertIn(finding["rule"], by_id)
+                    self.assertIsNone(finding["other_rule"])
+                    self.assertIsNone(finding["winner"])
+                    self.assertIsNone(finding["shadowed"])
+                    self.assertIsNone(finding["witness"])
+                    continue
+                seen_pair_finding = True
+                pair = (finding["rule"], finding["other_rule"])
+                self.assertEqual(len(pair), len(set(pair)))
+                self.assertNotIn(pair, seen_pairs)
+                seen_pairs.add(pair)
                 w = finding["witness"]
                 self.assertEqual(
                     set(w), {"subject", "action", "resource", "tags"}
@@ -1462,6 +1714,12 @@ def _min_common_from_patterns(first, second):
     return _min_common_string(
         _tokenize_pattern(first), _tokenize_pattern(second)
     )
+
+
+def _pattern_satisfiable(pattern):
+    from app import _tokenize_pattern, _pattern_satisfiable as sat
+
+    return sat(_tokenize_pattern(pattern))
 
 
 class SnapshotTest(unittest.TestCase):
@@ -2863,7 +3121,10 @@ class TagPatternsTest(unittest.TestCase):
                 {"id": "d", "effect": "deny"},
             ]
         )
-        self.assertEqual(gate.audit()["findings"], [])
+        # the unsatisfiable pattern flags rule "a" itself; no pair finding
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "unsatisfiable_rule")
+        self.assertEqual(finding["rule"], "a")
 
     def test_audit_shadowed_identical_tag_patterns(self):
         gate = PolicyGate(
@@ -4268,7 +4529,11 @@ class SelectorExclusionTest(unittest.TestCase):
                  "resource_exclude": "data/*"},
             ]
         )
-        self.assertEqual(gate.audit()["findings"], [])
+        # the deny rule's exclusion leaves it no usable value, so it is
+        # flagged as unsatisfiable itself and no pair finding is produced
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "unsatisfiable_rule")
+        self.assertEqual(finding["rule"], "d")
 
     def test_audit_overlap_around_exclusion(self):
         gate = PolicyGate(
@@ -4343,7 +4608,11 @@ class SelectorExclusionTest(unittest.TestCase):
                 {"id": "d", "effect": "deny"},
             ]
         )
-        self.assertEqual(gate.audit()["findings"], [])
+        # rule "a" can never match, so it is flagged itself and the pair
+        # produces no finding
+        (finding,) = gate.audit()["findings"]
+        self.assertEqual(finding["code"], "unsatisfiable_rule")
+        self.assertEqual(finding["rule"], "a")
 
     def test_empty_string_exclusion_carves_out_empty_witness(self):
         gate = PolicyGate(

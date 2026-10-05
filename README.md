@@ -13,6 +13,7 @@ Tests: python3 -m unittest discover -s tests -v
 
 `PolicyGate.audit()` 对已加载的规则做纯离线静态检查（不接收请求、无 I/O、不修改规则或后续判定），返回 `{"findings": [...], "summary": {"total", "error", "warning"}}`：
 
+- 先按声明顺序对每条规则单独做可达性检查：某维度的正向模式无任何可匹配字符串、声明的 `subject_exclude`/`action_exclude`/`resource_exclude` 排除了正向模式的全部匹配值，或某个 `tag_patterns` 模式无可匹配字符串时，该规则不可达，产生一条 `unsatisfiable_rule`（error）。精确 `tags`、`tag_presence` 与 `tag_exclude_patterns` 单独不会导致不可达（仅被排除约束的键可以缺席）。每条不可达规则只报告一次，`reason` 指出首个失败字段（按 `subject`、`action`、`resource`、`tag_patterns` 键名的 Unicode 码点顺序，即 action、resource、subject、tag_patterns）并区分“无正向匹配值”与“全部匹配值被排除”；`rule` 为该规则 id，`other_rule`、`winner`、`shadowed`、`witness` 均为 `None`。单规则 finding 按声明顺序排在所有成对 finding 之前，并计入 `summary` 的 `total`/`error`/`warning`；没有不可达规则时报告与既有成对审计完全一致。
 - 按声明顺序检查每对规则；主体/动作/资源模式按 `fnmatch.fnmatchcase` 真实语义判断是否存在共同匹配字符串，标签约束仅在同键不同值时冲突。
 - 非等价选择器且 effect 不同的重叠产生一条 `effect_overlap`（error），`winner` 为重叠范围内获胜的 deny 规则（显式拒绝覆盖 allow，priority 不改变结果）。
 - 三个模式文本和标签完全相同的选择器产生一条 `shadowed_rule`：allow 被 deny 遮蔽为 error，相同 effect 为 warning（按优先级再按声明顺序确定被遮蔽方）。
