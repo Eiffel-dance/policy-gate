@@ -2175,6 +2175,53 @@ class PolicyGate:
         }
         return {"traces": traces, "summary": summary}
 
+    def diagnose_many(self, requests):
+        """Batch counterpart of :meth:`diagnose`, for pre-release review.
+
+        ``requests`` uses the same list/tuple of request mappings as
+        :meth:`decide_many` and is validated exactly the same way: the
+        whole batch is checked first, and the first malformed element
+        raises :class:`PolicyBatchError` with its ``code``/``index``/
+        ``field`` instead of producing partial results.
+
+        Returns ``{"diagnoses": [...], "summary": {...}}`` with one
+        :meth:`diagnose` result per request in input order — each
+        identical to calling :meth:`diagnose` with the same arguments,
+        including the per-rule ``evaluations`` and first-failure
+        classification. ``summary`` has the fixed keys ``total``,
+        ``allow``, ``deny``, ``default_deny`` and ``matched_request``:
+        ``allow``/``deny`` count the final effects, ``default_deny``
+        counts requests that matched no rule at all (and therefore fell
+        through to the default deny), and ``matched_request`` counts
+        requests matching at least one rule. An empty batch yields
+        all-zero counts; with an empty rule set every request lands in
+        ``default_deny``.
+
+        Read-only and offline: rules and caller mappings are never
+        modified, no I/O happens, repeated calls return equal results,
+        and mutating a returned report never affects later calls.
+        """
+        self._validate_requests(requests)
+
+        diagnoses = [
+            self.diagnose(
+                item["subject"],
+                item["action"],
+                item["resource"],
+                item.get("tags"),
+            )
+            for item in requests
+        ]
+        default_deny = sum(1 for d in diagnoses if d["rule"] is None)
+        summary = {
+            "total": len(diagnoses),
+            "allow": sum(1 for d in diagnoses if d["effect"] == "allow"),
+            "deny": sum(1 for d in diagnoses if d["effect"] == "deny"),
+            "default_deny": default_deny,
+            "matched_request": len(diagnoses) - default_deny,
+        }
+        return {"diagnoses": diagnoses, "summary": summary}
+
     def audit(self):
         """Offline pre-release review of the loaded rules.
 

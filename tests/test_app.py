@@ -4402,5 +4402,180 @@ class RuleChangeReportTest(unittest.TestCase):
         self.assertEqual(report["summary"]["unchanged"], 1)
 
 
+class DiagnoseManyTests(unittest.TestCase):
+    def _gate(self):
+        return PolicyGate(
+            [
+                {"id": "admins", "effect": "allow", "priority": 10,
+                 "subject": "admin-*"},
+                {"id": "deny-tmp", "effect": "deny",
+                 "tag_patterns": {"env": "tmp-*"}},
+                {"id": "readers", "effect": "allow", "action": "read",
+                 "resource_exclude": "secret-*"},
+            ]
+        )
+
+    def _batch(self):
+        return [
+            {"subject": "admin-1", "action": "write", "resource": "doc"},
+            {"subject": "bob", "action": "read", "resource": "doc",
+             "tags": {"env": "tmp-1"}},
+            {"subject": "bob", "action": "read", "resource": "secret-1"},
+            {"subject": "bob", "action": "write", "resource": "doc",
+             "tags": None},
+        ]
+
+    def test_diagnoses_match_single_diagnose_in_order(self):
+        gate = self._gate()
+        batch = self._batch()
+        result = gate.diagnose_many(batch)
+        self.assertEqual(set(result), {"diagnoses", "summary"})
+        expected = [
+            gate.diagnose(item["subject"], item["action"], item["resource"],
+                          item.get("tags"))
+            for item in batch
+        ]
+        self.assertEqual(result["diagnoses"], expected)
+        self.assertEqual(
+            [d["rule"] for d in result["diagnoses"]],
+            ["admins", "deny-tmp", None, None],
+        )
+        # full per-rule evaluations, in declaration order, on every item
+        for diagnosis in result["diagnoses"]:
+            self.assertEqual(
+                [e["id"] for e in diagnosis["evaluations"]],
+                ["admins", "deny-tmp", "readers"],
+            )
+
+    def test_failure_classification_matches_diagnose(self):
+        gate = self._gate()
+        batch = [
+            {"subject": "bob", "action": "read", "resource": "secret-1"},
+        ]
+        (diagnosis,) = gate.diagnose_many(batch)["diagnoses"]
+        failures = {
+            e["id"]: e["failure"] for e in diagnosis["evaluations"]
+        }
+        self.assertEqual(
+            failures["admins"],
+            {"field": "subject", "key": None, "kind": "selector_mismatch"},
+        )
+        self.assertEqual(
+            failures["deny-tmp"],
+            {"field": "tags", "key": "env",
+             "kind": "tag_pattern_inapplicable"},
+        )
+        self.assertEqual(
+            failures["readers"],
+            {"field": "resource", "key": None, "kind": "selector_excluded"},
+        )
+
+    def test_summary_counts(self):
+        gate = self._gate()
+        summary = gate.diagnose_many(self._batch())["summary"]
+        self.assertEqual(
+            summary,
+            {"total": 4, "allow": 1, "deny": 3, "default_deny": 2,
+             "matched_request": 2},
+        )
+
+    def test_empty_batch_and_empty_rule_set(self):
+        gate = self._gate()
+        self.assertEqual(
+            gate.diagnose_many([]),
+            {"diagnoses": [],
+             "summary": {"total": 0, "allow": 0, "deny": 0,
+                         "default_deny": 0, "matched_request": 0}},
+        )
+        empty = PolicyGate([])
+        result = empty.diagnose_many(
+            [{"subject": "s", "action": "a", "resource": "r"}]
+        )
+        self.assertEqual(
+            result["summary"],
+            {"total": 1, "allow": 0, "deny": 1, "default_deny": 1,
+             "matched_request": 0},
+        )
+        self.assertEqual(result["diagnoses"][0]["evaluations"], [])
+        self.assertEqual(result["diagnoses"][0]["rule"], None)
+
+    def test_tuple_batch_and_tags_variants(self):
+        gate = self._gate()
+        batch = (
+            {"subject": "admin-1", "action": "a", "resource": "r"},
+            {"subject": "admin-1", "action": "a", "resource": "r",
+             "tags": None},
+            {"subject": "admin-1", "action": "a", "resource": "r",
+             "tags": {}},
+        )
+        result = gate.diagnose_many(batch)
+        self.assertEqual(result["summary"]["total"], 3)
+        self.assertEqual(
+            result["diagnoses"],
+            [gate.diagnose("admin-1", "a", "r")] * 3,
+        )
+
+    def test_validation_errors_abort_without_partial_results(self):
+        gate = self._gate()
+        good = {"subject": "s", "action": "a", "resource": "r"}
+
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.diagnose_many("not-a-batch")
+        self.assertEqual(ctx.exception.code, "invalid_batch")
+        self.assertIsNone(ctx.exception.index)
+
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.diagnose_many([good, 42])
+        self.assertEqual(ctx.exception.code, "item_not_mapping")
+        self.assertEqual(ctx.exception.index, 1)
+
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.diagnose_many([dict(good, bogus=1)])
+        self.assertEqual(ctx.exception.code, "unknown_field")
+        self.assertEqual(ctx.exception.field, "bogus")
+
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.diagnose_many([{"subject": "s", "action": "a"}])
+        self.assertEqual(ctx.exception.code, "missing_field")
+        self.assertEqual(ctx.exception.field, "resource")
+
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.diagnose_many([dict(good, action=1)])
+        self.assertEqual(ctx.exception.code, "invalid_field_type")
+        self.assertEqual(ctx.exception.field, "action")
+
+        with self.assertRaises(PolicyBatchError) as ctx:
+            gate.diagnose_many([dict(good, tags=[1])])
+        self.assertEqual(ctx.exception.code, "invalid_field_type")
+        self.assertEqual(ctx.exception.field, "tags")
+
+    def test_read_only_isolated_and_json_equivalent(self):
+        gate = self._gate()
+        batch = self._batch()
+        before_json = gate.to_json()
+        before_fp = gate.fingerprint()
+        first = gate.diagnose_many(batch)
+        for _ in range(3):
+            self.assertEqual(gate.diagnose_many(batch), first)
+        # mutating the report never affects later calls
+        first["diagnoses"][0]["evaluations"][0]["selected"] = "hacked"
+        first["diagnoses"][0]["effect"] = "hacked"
+        first["summary"]["total"] = 99
+        fresh = gate.diagnose_many(batch)
+        self.assertEqual(fresh["summary"]["total"], 4)
+        self.assertNotEqual(
+            fresh["diagnoses"][0]["evaluations"][0]["selected"], "hacked"
+        )
+        self.assertEqual(fresh["diagnoses"][0]["effect"], "allow")
+        # rules and inputs untouched
+        self.assertEqual(gate.to_json(), before_json)
+        self.assertEqual(gate.fingerprint(), before_fp)
+        self.assertNotIn("tags", batch[0])
+        self.assertIsNone(batch[3]["tags"])
+        # direct construction and from_json agree value for value
+        loaded = PolicyGate.from_json(gate.to_json())
+        self.assertEqual(loaded.diagnose_many(batch), fresh)
+
+
 if __name__ == "__main__":
     unittest.main()
