@@ -2016,6 +2016,183 @@ class PolicyGate:
         }
         return {"traces": traces, "summary": summary}
 
+    @staticmethod
+    def _dimension_failure(value, field, pattern, exclude):
+        """First failure of one string selector dimension, or None.
+
+        The positive ``fnmatch.fnmatchcase`` selector is examined before
+        the exclusion pattern, mirroring the conjunction reported by
+        :meth:`_dimension_matches`.
+        """
+        if not fnmatch.fnmatchcase(value, pattern):
+            return {
+                "field": field,
+                "key": None,
+                "kind": "selector_mismatch",
+            }
+        if exclude is not None and fnmatch.fnmatchcase(value, exclude):
+            return {
+                "field": field,
+                "key": None,
+                "kind": "selector_excluded",
+            }
+        return None
+
+    @staticmethod
+    def _tags_failure(rule, tags):
+        """First failing tag constraint, or None when every one passes.
+
+        Constraint groups are probed in the order exact ``tags``,
+        ``tag_patterns``, ``tag_exclude_patterns``, ``tag_presence``;
+        within a group keys come in Unicode code-point order. The kinds
+        follow the matching rules of :meth:`_tags_match`: a pattern
+        constraint on a missing key or a non-string value is
+        inapplicable rather than mismatched, an exclusion only fails on
+        a string value actually hitting the pattern, and presence only
+        looks at key existence.
+        """
+        for key in sorted(rule["tags"]):
+            if tags.get(key) != rule["tags"][key]:
+                return {"field": "tags", "key": key, "kind": "tag_exact_mismatch"}
+        for key in sorted(rule["tag_patterns"]):
+            value = tags.get(key)
+            if not isinstance(value, str):
+                return {
+                    "field": "tags",
+                    "key": key,
+                    "kind": "tag_pattern_inapplicable",
+                }
+            if not fnmatch.fnmatchcase(value, rule["tag_patterns"][key]):
+                return {
+                    "field": "tags",
+                    "key": key,
+                    "kind": "tag_pattern_mismatch",
+                }
+        for key in sorted(rule["tag_exclude_patterns"]):
+            value = tags.get(key)
+            if isinstance(value, str) and fnmatch.fnmatchcase(
+                value, rule["tag_exclude_patterns"][key]
+            ):
+                return {"field": "tags", "key": key, "kind": "tag_excluded"}
+        for key in sorted(rule["tag_presence"]):
+            required = rule["tag_presence"][key]
+            if (key in tags) != required:
+                return {
+                    "field": "tags",
+                    "key": key,
+                    "kind": "tag_presence_missing"
+                    if required
+                    else "tag_presence_forbidden",
+                }
+        return None
+
+    def diagnose(self, subject, action, resource, tags=None):
+        """Per-rule failure diagnosis of one request, for offline review.
+
+        Shares :meth:`decide`'s input boundary and its selection
+        semantics: non-string ``subject``/``action``/``resource`` or a
+        ``tags`` value that is neither ``None`` nor a mapping raise
+        ``TypeError`` (``tags=None`` counts as an empty mapping), and the
+        root ``effect``, ``rule`` and ``reason`` are exactly what
+        :meth:`decide` returns — explicit deny, priority, declaration
+        order and default deny are unchanged. Inputs are never modified.
+
+        Adds ``evaluations``, one entry per loaded rule in declaration
+        order, each with the fixed key order ``id``, ``effect``,
+        ``priority``, ``subject_match``, ``action_match``,
+        ``resource_match``, ``tags_match``, ``matched``, ``selected``,
+        ``failure``. The match flags mirror :meth:`trace` exactly;
+        ``selected`` is true only on the final winning rule. ``failure``
+        is ``None`` for a matched rule, otherwise it records the first
+        failing condition as ``{"field", "key", "kind"}``: the string
+        dimensions are checked in subject/action/resource order (the
+        positive ``fnmatch.fnmatchcase`` selector before that
+        dimension's exclusion pattern, yielding ``selector_mismatch`` or
+        ``selector_excluded`` with ``key`` null) and then the tag
+        constraints in exact ``tags``, ``tag_patterns``,
+        ``tag_exclude_patterns``, ``tag_presence`` order with keys sorted
+        by Unicode code point — ``tag_exact_mismatch`` (the same
+        ``tags.get`` equality semantics as matching),
+        ``tag_pattern_inapplicable`` (missing key or non-string value),
+        ``tag_pattern_mismatch``, ``tag_excluded``,
+        ``tag_presence_missing`` and ``tag_presence_forbidden``. Every
+        returned mapping is built fresh, so repeated calls are stable
+        and mutating a result never affects later calls. Read-only and
+        offline: no I/O happens.
+        """
+        tags = self._check_inputs(subject, action, resource, tags)
+
+        evaluations = []
+        matched = []
+        for r in self.rules:
+            subject_match = PolicyGate._dimension_matches(
+                subject, r["subject"], r["subject_exclude"]
+            )
+            action_match = PolicyGate._dimension_matches(
+                action, r["action"], r["action_exclude"]
+            )
+            resource_match = PolicyGate._dimension_matches(
+                resource, r["resource"], r["resource_exclude"]
+            )
+            tags_match = PolicyGate._tags_match(r, tags)
+            rule_matched = (
+                subject_match and action_match and resource_match and tags_match
+            )
+            if rule_matched:
+                matched.append(r)
+                failure = None
+            else:
+                # First failure follows the fixed subject, action,
+                # resource, tags dimension order.
+                failure = (
+                    PolicyGate._dimension_failure(
+                        subject,
+                        "subject",
+                        r["subject"],
+                        r["subject_exclude"],
+                    )
+                    if not subject_match
+                    else None
+                )
+                if failure is None and not action_match:
+                    failure = PolicyGate._dimension_failure(
+                        action,
+                        "action",
+                        r["action"],
+                        r["action_exclude"],
+                    )
+                if failure is None and not resource_match:
+                    failure = PolicyGate._dimension_failure(
+                        resource,
+                        "resource",
+                        r["resource"],
+                        r["resource_exclude"],
+                    )
+                if failure is None:
+                    failure = PolicyGate._tags_failure(r, tags)
+            evaluations.append(
+                {
+                    "id": r["id"],
+                    "effect": r["effect"],
+                    "priority": r["priority"],
+                    "subject_match": subject_match,
+                    "action_match": action_match,
+                    "resource_match": resource_match,
+                    "tags_match": tags_match,
+                    "matched": rule_matched,
+                    "selected": False,
+                    "failure": failure,
+                }
+            )
+
+        decision, winner = self._select(matched)
+        if winner is not None:
+            evaluations[winner["_index"]]["selected"] = True
+
+        result = dict(decision)
+        result["evaluations"] = evaluations
+        return result
+
     def audit(self):
         """Offline pre-release review of the loaded rules.
 

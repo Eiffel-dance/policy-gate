@@ -67,6 +67,17 @@ Tests: python3 -m unittest discover -s tests -v
 - `trace_many` 的 `requests` 沿用 `decide_many` 的边界，整批先校验，首个错误抛原有 `PolicyBatchError`（带 `code`、`index`、`field`），不返回部分结果；成功返回 `{"traces": [...], "summary": {"total", "allow", "deny"}}`，`traces` 按输入顺序排列，计数与 `decide_many` 相同，空批次为全零。
 - 两个入口只读、纯离线：不修改规则或调用方映射，无网络和其他 I/O；直接构造和 `from_json` 加载的规则具有相同追踪语义，且不影响 `decide`、`decide_many`、`explain`、`audit`、`coverage`、`compare`、`from_json`、`to_json`、`fingerprint` 的既有行为。
 
+## 逐规则失配诊断
+
+`PolicyGate.diagnose(subject, action, resource, tags=None)` 在 `trace` 的基础上为每条未命中规则给出首个失配原因，供离线定位“为什么这条规则没生效”；不引入落盘或外部依赖。
+
+- 输入边界与 `decide` 完全一致：`subject`、`action`、`resource` 必须为字符串，`tags` 为非 `None` 非 mapping 时抛 `TypeError`，`tags=None` 视为空映射；不修改任何输入。根级 `effect`、`rule`、`reason` 与 `decide` 的返回逐项相等，显式 deny、priority、声明顺序和默认 deny 语义完全沿用。
+- 返回映射在根级决策之外附按声明顺序排列的 `evaluations`。每项按固定顺序含 `id`、`effect`、`priority`、`subject_match`、`action_match`、`resource_match`、`tags_match`、`matched`、`selected`、`failure`：前四个匹配标志、`matched` 合取及 `selected`（仅最终赢家为真，默认 deny 时全假）与 `trace` 完全一致。
+- 匹配规则的 `failure` 为 `null`；未匹配规则的 `failure` 固定含 `field`、`key`、`kind`，按 `subject`、`action`、`resource`、`tags` 的维度顺序取首个失败：
+  - 字符串维度先查 `fnmatch.fnmatchcase` 正向模式（失败为 `selector_mismatch`），再查该维度排除模式（命中为 `selector_excluded`）；这两类 `field` 为维度名、`key` 为 `null`。
+  - 标签维度按 exact `tags`、`tag_patterns`、`tag_exclude_patterns`、`tag_presence` 的组顺序检查，组内键按 Unicode 码点排序，`field` 为 `tags`、`key` 为对应约束键。`kind` 依次为：精确约束不等的 `tag_exact_mismatch`（沿用匹配时的 `tags.get` 相等语义）；模式约束键缺失或值非字符串的 `tag_pattern_inapplicable`，值为字符串但不匹配模式的 `tag_pattern_mismatch`；字符串值实际命中排除模式的 `tag_excluded`（缺失或非字符串通过）；要求存在但缺失的 `tag_presence_missing`；要求缺失但存在的 `tag_presence_forbidden`。
+- 接口只读、纯离线：直接构造与 `from_json` 结果一致，重复调用稳定，修改返回对象不影响后续调用，且不改变任何既有入口的行为及加载错误。
+
 ## 发布前固定用例核验
 
 `PolicyGate.verify(cases)` 在发布前按一组固定用例核对规则的最终决策，纯离线、只读，不改变规则或输入。

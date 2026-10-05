@@ -4402,5 +4402,375 @@ class RuleChangeReportTest(unittest.TestCase):
         self.assertEqual(report["summary"]["unchanged"], 1)
 
 
+class DiagnoseTest(unittest.TestCase):
+    def _gate(self):
+        return PolicyGate(
+            [
+                {
+                    "id": "read",
+                    "effect": "allow",
+                    "action": "read",
+                    "resource": "docs/*",
+                },
+                {
+                    "id": "write",
+                    "effect": "allow",
+                    "action": "write",
+                    "resource": "docs/*",
+                    "subject_exclude": "bot*",
+                    "tags": {"env": "prod"},
+                    "tag_patterns": {"team": "adm*"},
+                    "tag_exclude_patterns": {"tmp": "ephemeral-*"},
+                    "tag_presence": {"v": True, "gone": False},
+                },
+                {
+                    "id": "lock",
+                    "effect": "deny",
+                    "action": "read",
+                    "resource": "docs/secret*",
+                    "priority": 5,
+                },
+            ]
+        )
+
+    def test_root_matches_decide_and_shape(self):
+        gate = self._gate()
+        tags = {"env": "prod", "team": "admins", "v": 1}
+        for args in (
+            ("alice", "read", "docs/a", tags),
+            ("alice", "write", "docs/a", tags),
+            ("alice", "read", "docs/secret", tags),
+            ("alice", "read", "docs/secret", None),
+            ("alice", "noop", "x", {}),
+        ):
+            report = gate.diagnose(*args)
+            decision = gate.decide(*args)
+            for key in ("effect", "rule", "reason"):
+                self.assertEqual(report[key], decision[key])
+            self.assertEqual(
+                list(report),
+                ["effect", "rule", "reason", "evaluations"],
+            )
+            self.assertEqual(
+                [e["id"] for e in report["evaluations"]],
+                ["read", "write", "lock"],
+            )
+            for entry in report["evaluations"]:
+                self.assertEqual(
+                    list(entry),
+                    [
+                        "id",
+                        "effect",
+                        "priority",
+                        "subject_match",
+                        "action_match",
+                        "resource_match",
+                        "tags_match",
+                        "matched",
+                        "selected",
+                        "failure",
+                    ],
+                )
+
+    def test_flags_and_selected_match_trace(self):
+        gate = self._gate()
+        requests = [
+            ("alice", "read", "docs/a", None),
+            ("alice", "write", "docs/a", {"env": "prod", "team": "adm-x", "v": 0}),
+            ("bot1", "write", "docs/a", {"env": "prod", "team": "adm", "v": 0}),
+            ("alice", "write", "docs/a", {"env": "dev", "team": "adm", "v": 0}),
+            ("alice", "write", "docs/a", {"env": "prod", "team": "adm",
+                                          "tmp": "ephemeral-9", "v": 0}),
+            ("alice", "write", "docs/a", {"env": "prod", "team": "adm", "gone": 1}),
+            ("alice", "write", "docs/a", {"env": "prod", "team": "adm"}),
+            ("alice", "read", "docs/secret", None),
+            ("alice", "read", "nope", None),
+        ]
+        for args in requests:
+            report = gate.diagnose(*args)
+            trace = gate.trace(*args)
+            for got, expected in zip(report["evaluations"], trace["evaluations"]):
+                for key in (
+                    "id",
+                    "effect",
+                    "priority",
+                    "subject_match",
+                    "action_match",
+                    "resource_match",
+                    "tags_match",
+                    "matched",
+                    "selected",
+                ):
+                    self.assertEqual(got[key], expected[key])
+            selected = [e["id"] for e in report["evaluations"] if e["selected"]]
+            if report["rule"] is None:
+                self.assertEqual(selected, [])
+            else:
+                self.assertEqual(selected, [report["rule"]])
+
+    def test_failure_null_for_matched_rules(self):
+        gate = self._gate()
+        report = gate.diagnose("alice", "read", "docs/a")
+        first = report["evaluations"][0]
+        self.assertTrue(first["matched"])
+        self.assertIsNone(first["failure"])
+
+    def test_empty_gate_is_default_deny(self):
+        report = PolicyGate([]).diagnose("alice", "read", "docs/a")
+        self.assertEqual(report["effect"], "deny")
+        self.assertIsNone(report["rule"])
+        self.assertEqual(report["reason"], "default deny")
+        self.assertEqual(report["evaluations"], [])
+
+    def test_selector_mismatch_and_excluded_kinds(self):
+        mismatch = PolicyGate(
+            [{"id": "m", "effect": "allow", "subject": "admin*"}]
+        )
+        self.assertEqual(
+            mismatch.diagnose("bob", "a", "r")["evaluations"][0]["failure"],
+            {"field": "subject", "key": None, "kind": "selector_mismatch"},
+        )
+
+        excluded = PolicyGate(
+            [{"id": "e", "effect": "allow", "subject": "*",
+              "subject_exclude": "bot*"}]
+        )
+        self.assertEqual(
+            excluded.diagnose("bot1", "a", "r")["evaluations"][0]["failure"],
+            {"field": "subject", "key": None, "kind": "selector_excluded"},
+        )
+        # A value outside the exclusion still matches, so no failure.
+        self.assertIsNone(
+            excluded.diagnose("alice", "a", "r")["evaluations"][0]["failure"]
+        )
+
+    def test_selector_positive_checked_before_exclusion(self):
+        # Positive pattern fails and exclusion also hits: mismatch wins.
+        gate = PolicyGate(
+            [{"id": "r", "effect": "allow", "subject": "admin*",
+              "subject_exclude": "bob"}]
+        )
+        failure = gate.diagnose("bob", "a", "r")["evaluations"][0]["failure"]
+        self.assertEqual(failure["kind"], "selector_mismatch")
+
+    def test_tag_failure_kinds(self):
+        cases = [
+            ({"tags": {"env": "prod"}}, {"env": "dev"}, "tag_exact_mismatch"),
+            ({"tag_patterns": {"env": "pr*"}}, {}, "tag_pattern_inapplicable"),
+            ({"tag_patterns": {"env": "pr*"}}, {"env": 5},
+             "tag_pattern_inapplicable"),
+            ({"tag_patterns": {"env": "pr*"}}, {"env": "dev"},
+             "tag_pattern_mismatch"),
+            ({"tag_exclude_patterns": {"env": "tmp-*"}}, {"env": "tmp-x"},
+             "tag_excluded"),
+            ({"tag_presence": {"env": True}}, {}, "tag_presence_missing"),
+            ({"tag_presence": {"env": False}}, {"env": 1},
+             "tag_presence_forbidden"),
+        ]
+        for fields, tags, kind in cases:
+            rule = {"id": "r", "effect": "allow"}
+            rule.update(fields)
+            failure = PolicyGate([rule]).diagnose(
+                "s", "x", "r", tags
+            )["evaluations"][0]["failure"]
+            self.assertEqual(failure["field"], "tags")
+            self.assertEqual(failure["key"], "env")
+            self.assertEqual(failure["kind"], kind)
+
+    def test_tag_exact_uses_tags_get_equality(self):
+        # Non-string exact values compare by equality, like matching.
+        gate = PolicyGate([{"id": "r", "effect": "allow", "tags": {"n": 2}}])
+        self.assertIsNone(
+            gate.diagnose("s", "x", "r", {"n": 2})["evaluations"][0]["failure"]
+        )
+        self.assertEqual(
+            gate.diagnose("s", "x", "r", {"n": 3})["evaluations"][0]["failure"][
+                "kind"
+            ],
+            "tag_exact_mismatch",
+        )
+        # bool/int equality is the plain == semantics
+        gate = PolicyGate([{"id": "r", "effect": "allow", "tags": {"n": True}}])
+        self.assertIsNone(
+            gate.diagnose("s", "x", "r", {"n": 1})["evaluations"][0]["failure"]
+        )
+
+    def test_dimension_order_subject_action_resource_tags(self):
+        rule = {
+            "id": "r",
+            "effect": "allow",
+            "subject": "a",
+            "action": "a",
+            "resource": "a",
+            "tags": {"k": "v"},
+        }
+        gate = PolicyGate([rule])
+        self.assertEqual(
+            gate.diagnose("b", "b", "b", {})["evaluations"][0]["failure"][
+                "field"
+            ],
+            "subject",
+        )
+        self.assertEqual(
+            gate.diagnose("a", "b", "b", {})["evaluations"][0]["failure"][
+                "field"
+            ],
+            "action",
+        )
+        self.assertEqual(
+            gate.diagnose("a", "a", "b", {})["evaluations"][0]["failure"][
+                "field"
+            ],
+            "resource",
+        )
+        failure = gate.diagnose("a", "a", "a", {})["evaluations"][0]["failure"]
+        self.assertEqual(
+            failure, {"field": "tags", "key": "k", "kind": "tag_exact_mismatch"}
+        )
+
+    def test_tag_groups_checked_in_fixed_order(self):
+        gate = PolicyGate(
+            [
+                {
+                    "id": "r",
+                    "effect": "allow",
+                    "tags": {"a": 1},
+                    "tag_patterns": {"b": "x*"},
+                    "tag_exclude_patterns": {"c": "z*"},
+                    "tag_presence": {"d": True},
+                }
+            ]
+        )
+        tags = {"a": 2, "b": "no", "c": "zzz", "d": "present"}
+        failure = gate.diagnose("s", "x", "r", tags)["evaluations"][0]["failure"]
+        self.assertEqual(failure["kind"], "tag_exact_mismatch")
+        self.assertEqual(failure["key"], "a")
+
+        tags = {"a": 1, "b": "no", "c": "zzz", "d": "present"}
+        failure = gate.diagnose("s", "x", "r", tags)["evaluations"][0]["failure"]
+        self.assertEqual(failure["kind"], "tag_pattern_mismatch")
+        self.assertEqual(failure["key"], "b")
+
+        tags = {"a": 1, "b": "x1", "c": "zzz", "d": "present"}
+        failure = gate.diagnose("s", "x", "r", tags)["evaluations"][0]["failure"]
+        self.assertEqual(failure["kind"], "tag_excluded")
+        self.assertEqual(failure["key"], "c")
+
+        tags = {"a": 1, "b": "x1", "c": "other"}
+        failure = gate.diagnose("s", "x", "r", tags)["evaluations"][0]["failure"]
+        self.assertEqual(failure["kind"], "tag_presence_missing")
+        self.assertEqual(failure["key"], "d")
+
+    def test_tag_keys_sorted_by_unicode_codepoint(self):
+        # Both exact constraints fail; smallest code point is reported.
+        gate = PolicyGate(
+            [{"id": "r", "effect": "allow", "tags": {"z": 1, "é": 1, "a": 1}}]
+        )
+        failure = gate.diagnose("s", "x", "r", {})["evaluations"][0]["failure"]
+        self.assertEqual(failure["key"], "a")
+        gate = PolicyGate(
+            [{"id": "r", "effect": "allow", "tags": {"z": 1, "é": 1}}]
+        )
+        failure = gate.diagnose("s", "x", "r", {})["evaluations"][0]["failure"]
+        self.assertEqual(failure["key"], "z")  # U+007A < U+00E9
+
+    def test_tags_none_treated_as_empty_mapping(self):
+        gate = PolicyGate([{"id": "r", "effect": "allow", "tags": {"k": "v"}}])
+        self.assertEqual(
+            gate.diagnose("s", "x", "r")["evaluations"][0]["failure"],
+            gate.diagnose("s", "x", "r", {})["evaluations"][0]["failure"],
+        )
+
+    def test_input_validation_type_errors(self):
+        gate = self._gate()
+        for kwargs in (
+            {"subject": 1},
+            {"action": 1},
+            {"resource": 1},
+        ):
+            with self.assertRaises(TypeError):
+                gate.diagnose(
+                    kwargs.get("subject", "s"),
+                    kwargs.get("action", "a"),
+                    kwargs.get("resource", "r"),
+                    None,
+                )
+        with self.assertRaises(TypeError):
+            gate.diagnose("s", "a", "r", 42)
+        with self.assertRaises(TypeError):
+            gate.diagnose("s", "a", "r", ["not", "mapping"])
+
+    def test_inputs_are_not_modified(self):
+        gate = self._gate()
+        tags = {"env": "prod", "team": "admins", "v": 1}
+        tags_before = dict(tags)
+        gate.diagnose("alice", "write", "docs/a", tags)
+        self.assertEqual(tags, tags_before)
+
+    def test_repeated_calls_stable_and_mutation_isolated(self):
+        gate = self._gate()
+        first = gate.diagnose("alice", "read", "docs/a")
+        second = gate.diagnose("alice", "read", "docs/a")
+        self.assertEqual(first, second)
+        first["evaluations"][0]["failure"] = {"field": "tags", "key": "h",
+                                              "kind": "tag_excluded"}
+        first["evaluations"][0]["id"] = "tampered"
+        third = gate.diagnose("alice", "read", "docs/a")
+        self.assertEqual(third, second)
+
+    def test_direct_and_from_json_agree(self):
+        gate = self._gate()
+        loaded = PolicyGate.from_json(gate.to_json())
+        args = ("alice", "write", "docs/a", {"env": "dev", "team": "ops"})
+        self.assertEqual(loaded.diagnose(*args), gate.diagnose(*args))
+
+    def test_selection_honors_deny_priority_and_order(self):
+        gate = PolicyGate(
+            [
+                {"id": "low", "effect": "allow", "priority": 1},
+                {"id": "high", "effect": "allow", "priority": 9},
+                {"id": "deny", "effect": "deny", "priority": 0},
+            ]
+        )
+        report = gate.diagnose("s", "x", "r")
+        self.assertEqual(report["rule"], "deny")
+        selected = {e["id"]: e["selected"] for e in report["evaluations"]}
+        self.assertTrue(selected["deny"])
+        self.assertFalse(selected["high"])
+        self.assertFalse(selected["low"])
+
+        gate = PolicyGate(
+            [
+                {"id": "first", "effect": "allow", "priority": 5},
+                {"id": "second", "effect": "allow", "priority": 5},
+            ]
+        )
+        report = gate.diagnose("s", "x", "r")
+        self.assertEqual(report["rule"], "first")
+        selected = [e["id"] for e in report["evaluations"] if e["selected"]]
+        self.assertEqual(selected, ["first"])
+
+    def test_exclusion_pass_for_missing_or_nonstring_tag(self):
+        # Exclusion constraints pass on missing/non-string values and only
+        # fail on an actual string hit; then tags_match is driven by other
+        # constraints, and failure (if any) comes from those.
+        gate = PolicyGate(
+            [{"id": "r", "effect": "allow",
+              "tag_exclude_patterns": {"env": "tmp-*"}}]
+        )
+        self.assertIsNone(
+            gate.diagnose("s", "x", "r", {})["evaluations"][0]["failure"]
+        )
+        self.assertIsNone(
+            gate.diagnose("s", "x", "r", {"env": 7})["evaluations"][0]["failure"]
+        )
+        self.assertEqual(
+            gate.diagnose("s", "x", "r", {"env": "tmp-x"})["evaluations"][0][
+                "failure"
+            ]["kind"],
+            "tag_excluded",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
