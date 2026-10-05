@@ -29,6 +29,16 @@ Tests: python3 -m unittest discover -s tests -v
 - 直接构造的规则若含不能无损表示为严格 JSON 的值（元组、集合、非有限数字、含非字符串键的嵌套映射，或无法 UTF-8 编码的孤立代理项），`to_json` 与 `fingerprint` 均抛出消息含固定标识 `non_json_value` 的 `ValueError`，且不返回任何部分文本。
 - 快照功能纯离线：无文件、网络或其他外部 I/O。
 
+## 版本化策略文档
+
+`PolicyGate.from_json` 除旧根数组外，同时接受版本化根对象，让发布前加载时确认文档格式与策略身份。根对象只允许 `version`、`rules`、`fingerprint` 三个键：`version` 必填且必须为整数 `1`；`rules` 必填且必须为规则数组（规则字段校验与旧数组完全一致）；`fingerprint` 可省略，提供时必须是 64 位小写十六进制 SHA-256，且等于 `rules` 规范快照的指纹（即 `fingerprint()` 的返回值）。
+
+- 根值既非数组也非对象时报 `root_not_array_or_object`；对象封装错误按固定优先级报告首个问题：未知键 `unknown_document_field`、缺失 version `missing_version`、version 类型错误 `invalid_version`、版本不支持 `unsupported_version`、缺失 rules `missing_rules`、rules 类型错误 `rules_not_array`、摘要格式错误 `invalid_fingerprint`、摘要不匹配 `fingerprint_mismatch`。以上均在加载阶段抛出带 `code` 的 `PolicyConfigError`；重复键、非法 JSON、元素非对象和规则字段语义错误沿用既有校验（后两者分别为 `duplicate_key`/`invalid_json`/`rule_not_object` 与 plain `ValueError`）。
+- 版本化加载成功后 `document_version` 为 `1`；旧数组加载和直接构造的 gate `document_version` 为 `None`。
+- 版本化 gate 的 `to_json()` 按 `version`、`rules`、`fingerprint` 固定顺序输出规范对象：`rules` 是与旧格式逐字节相同的规范规则数组，`fingerprint` 为规则快照摘要，输入提供的摘要因此被原样保留；省略摘要加载时输出自动补全的计算值。旧数组与直接构造仍输出既有的规范数组。
+- `fingerprint()` 始终对规范规则数组（不含封装）取 SHA-256，三种来源的等价规则得到相同指纹；`from_json(to_json())` 往返后 `decide`、`explain`、`trace`、`diagnose`、`audit`、`coverage`、`compare`、`verify` 等所有结果逐值相同，版本化导出逐字节稳定。
+- 加载与导出保持离线、只读：不修改调用方映射，无文件、网络或其他外部 I/O；空规则、显式拒绝、优先级、通配和默认拒绝语义不变。
+
 ## 策略版本回归比较
 
 `PolicyGate.compare(candidate, requests)` 把调用对象作为基线、`candidate`（必须为 `PolicyGate`，否则抛 `TypeError`）作为候选，对同一批请求分别按各自既有的通配、显式 deny、priority、声明顺序和默认 deny 规则判定，定位候选改动。
